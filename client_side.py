@@ -30,12 +30,9 @@ while cap.isOpened():
         print(f"Request failed: {e}")
         continue
 
-    # --- draw results on the (resized) frame ---
-    for d in dets:
-        x1, y1, x2, y2 = map(int, d["box"])
-        cv2.rectangle(small, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(small, f'{d["label"]} {d["id"]}', (x1, y1 - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    labels = [d["label"] for d in dets]
+    counts = {l: labels.count(l) for l in set(labels)}
+    print(f"{len(dets)} objects | {counts}")
 
     elapsed = time.time() - start
     print(f"Round-trip: {elapsed*1000:.0f}ms | {len(dets)} objects")
