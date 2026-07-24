@@ -19,7 +19,7 @@ def detect():
     boxes = results[0].boxes
     dets = []
     if boxes.id is not None:
-        for box, tid, cls, conf in zip(
+        for tid, cls, conf in zip(
             #boxes.xyxy.tolist(),
             boxes.id.int().tolist(),
             boxes.cls.int().tolist(),
