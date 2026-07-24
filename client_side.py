@@ -3,7 +3,7 @@ import time
 import requests
 
 CLOUD_URL = "http://10.0.0.2:8000/detect" # change to http://10.0.0.2:8000/detect on VMs "http://127.0.0.1:8000/detect" 
-SHOW_VIDEO = Falsec                              # False on headless VMs
+SHOW_VIDEO = False                             # False on headless VMs
 
 cap = cv2.VideoCapture("traffic.mp4")
 fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
