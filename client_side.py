@@ -1,67 +1,88 @@
+from flask import Flask, request, jsonify
+from ultralytics import YOLO
 import cv2
+import numpy as np
+import psutil
 import time
-import requests
+from collections import deque
+import threading
 
-CLOUD_URL = "http://10.0.0.2:8000/detect"   # local test: "http://127.0.0.1:8000/detect"
-SHOW_VIDEO = False                            # False on headless VMs
+app = Flask(__name__)
+model = YOLO("yolo11n.pt")
 
-cap = cv2.VideoCapture("traffic.mp4")
-if not cap.isOpened():
-    print("ERROR: could not open video file")
-    exit()
+# --- rolling stores for the dashboard (last N samples) ---
+edge_metrics_history = deque(maxlen=300)    # pushed from the edge
+cloud_metrics_history = deque(maxlen=300)   # sampled locally
+lock = threading.Lock()
 
-fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-frame_delay = 1.0 / fps
+# --- background thread: sample cloud resources once a second ---
+def sample_cloud_metrics():
+    proc = psutil.Process()
+    while True:
+        with lock:
+            cloud_metrics_history.append({
+                "ts": time.time(),
+                "cpu_percent": psutil.cpu_percent(),
+                "cpu_per_core": psutil.cpu_percent(percpu=True),
+                "mem_percent": psutil.virtual_memory().percent,
+                "mem_used_mb": round(psutil.virtual_memory().used / 1e6, 1),
+                "net_sent_mb": round(psutil.net_io_counters().bytes_sent / 1e6, 1),
+                "net_recv_mb": round(psutil.net_io_counters().bytes_recv / 1e6, 1),
+                "proc_cpu": proc.cpu_percent(),
+                "proc_mem_mb": round(proc.memory_info().rss / 1e6, 1),
+                "load_avg": psutil.getloadavg()[0],
+            })
+        time.sleep(1)
 
-seen_ids = set()                              # every unique track ID ever seen
+threading.Thread(target=sample_cloud_metrics, daemon=True).start()
 
-while cap.isOpened():
-    start = time.time()
-    success, frame = cap.read()
-    if not success:
-        print("Playback complete.")
-        break
 
-    # --- edge preprocessing: resize + JPEG encode ---
-    small = cv2.resize(frame, (960, 540))
-    ok, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 80])
+@app.route("/detect", methods=["POST"])
+def detect():
+    t0 = time.time()
+    jpg_bytes = request.data
+    arr = np.frombuffer(jpg_bytes, dtype=np.uint8)
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
-    # --- send to cloud, get detections + metrics ---
-    try:
-        resp = requests.post(CLOUD_URL, data=buf.tobytes(),
-                             headers={"Content-Type": "application/octet-stream"},
-                             timeout=5)
-        data = resp.json()
-        dets = data["detections"]
-        metrics = data.get("metrics", {})
-    except requests.RequestException as e:
-        print(f"Request failed: {e}")
-        continue
+    results = model.track(frame, persist=True, conf=0.3, verbose=False,
+                          classes=[2, 3, 5, 7])
+    inference_ms = (time.time() - t0) * 1000
 
-    # --- per-frame counts ---
-    labels = [d["label"] for d in dets]
-    counts = {l: labels.count(l) for l in set(labels)}
+    boxes = results[0].boxes
+    dets = []
+    if boxes.id is not None:
+        for tid, cls, conf in zip(
+            boxes.id.int().tolist(),
+            boxes.cls.int().tolist(),
+            boxes.conf.tolist(),
+        ):
+            dets.append({"id": tid, "label": results[0].names[cls],
+                         "conf": round(conf, 2)})
 
-    # --- unique vehicle total across the whole run ---
-    seen_ids.update(d["id"] for d in dets)
+    return jsonify({
+        "detections": dets,
+        "inference_ms": round(inference_ms, 1),   # cloud-side compute time for THIS frame
+    })
 
-    elapsed = time.time() - start
 
-    # --- print everything together ---
-    print(
-        f"Round-trip: {elapsed*1000:.0f}ms | "
-        f"In frame: {len(dets)} {counts} | "
-        f"Unique vehicles: {len(seen_ids)} | "
-        f"Cloud: infer {metrics.get('inference_ms', '?')}ms "
-        f"CPU {metrics.get('cpu_percent', '?')}% "
-        f"Mem {metrics.get('mem_percent', '?')}%"
-    )
+@app.route("/metrics", methods=["POST"])
+def receive_metrics():
+    """Edge pushes its metrics here."""
+    data = request.get_json()
+    with lock:
+        edge_metrics_history.append(data)
+    return jsonify({"status": "ok"})
 
-    if SHOW_VIDEO:
-        cv2.imshow("Edge View", small)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
 
-cap.release()
-if SHOW_VIDEO:
-    cv2.destroyAllWindows()
+@app.route("/metrics/data")
+def metrics_data():
+    """Dashboard reads combined history from here."""
+    with lock:
+        return jsonify({
+            "edge": list(edge_metrics_history),
+            "cloud": list(cloud_metrics_history),
+        })
+
+
+if __name__ == "__main__":
+    app.run(host="10.0.0.2", port=8000)
