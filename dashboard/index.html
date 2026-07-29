@@ -168,19 +168,19 @@
         <div class="sub">cumulative since pipeline start</div>
       </div>
       <div class="stat-card">
-        <div class="label">In-flight requests</div>
+        <div class="label">Unique objects tracked</div>
         <div class="value" id="stat-inflight">—</div>
-        <div class="sub">currently being processed</div>
+        <div class="sub">distinct track IDs seen so far</div>
       </div>
       <div class="stat-card">
         <div class="label">Processing rate</div>
         <div class="value" id="stat-rate">—</div>
-        <div class="sub">frames/sec, derived from totals</div>
+        <div class="sub">frames/sec, reported by the edge</div>
       </div>
       <div class="stat-card">
-        <div class="label">Pipeline status</div>
+        <div class="label">Content-shift status</div>
         <div class="value" id="stat-status">—</div>
-        <div class="sub" id="stat-status-sub">processed vs. incoming rate</div>
+        <div class="sub" id="stat-status-sub">frame-diff vs. rolling baseline</div>
       </div>
     </div>
     <div class="stale-banner" id="stale-banner">Not receiving fresh data — showing last known values.</div>
@@ -188,14 +188,22 @@
 
   <section>
     <h2>Resource utilization</h2>
-    <div class="chart-grid">
+    <div class="chart-grid cols-2">
       <div class="chart-card">
         <div class="card-head">
-          <h3>CPU / Memory / GPU</h3>
+          <h3>Cloud CPU / Memory</h3>
           <button class="table-toggle" data-target="resource">View as table</button>
         </div>
         <div class="canvas-wrap"><canvas id="chart-resource"></canvas></div>
         <div class="data-table" id="table-resource"></div>
+      </div>
+      <div class="chart-card">
+        <div class="card-head">
+          <h3>Edge CPU / Memory</h3>
+          <button class="table-toggle" data-target="edgeResource">View as table</button>
+        </div>
+        <div class="canvas-wrap"><canvas id="chart-edge-resource"></canvas></div>
+        <div class="data-table" id="table-edgeResource"></div>
       </div>
     </div>
   </section>
@@ -213,7 +221,15 @@
       </div>
       <div class="chart-card">
         <div class="card-head">
-          <h3>Latency (ms)</h3>
+          <h3>Objects detected</h3>
+          <button class="table-toggle" data-target="objects">View as table</button>
+        </div>
+        <div class="canvas-wrap"><canvas id="chart-objects"></canvas></div>
+        <div class="data-table" id="table-objects"></div>
+      </div>
+      <div class="chart-card">
+        <div class="card-head">
+          <h3>Latency breakdown (ms)</h3>
           <button class="table-toggle" data-target="latency">View as table</button>
         </div>
         <div class="canvas-wrap"><canvas id="chart-latency"></canvas></div>
@@ -227,11 +243,11 @@
     <div class="chart-grid cols-2">
       <div class="chart-card">
         <div class="card-head">
-          <h3>Filter rate</h3>
-          <button class="table-toggle" data-target="filterrate">View as table</button>
+          <h3>Content-shift rate</h3>
+          <button class="table-toggle" data-target="contentshift">View as table</button>
         </div>
-        <div class="canvas-wrap"><canvas id="chart-filterrate"></canvas></div>
-        <div class="data-table" id="table-filterrate"></div>
+        <div class="canvas-wrap"><canvas id="chart-contentshift"></canvas></div>
+        <div class="data-table" id="table-contentshift"></div>
       </div>
       <div class="chart-card">
         <div class="card-head">
@@ -251,12 +267,12 @@
 // CONFIG — the only place you should need to edit
 // ============================================================
 const CONFIG = {
-  METRICS_URL: "http://localhost:8000/metrics",
+  METRICS_URL: "http://localhost:8000/metrics/data",
   POLL_INTERVAL_MS: 1000,
-  WINDOW_SIZE: 90,          // rolling samples kept on screen per chart
+  WINDOW_SIZE: 90,           // rolling samples kept on screen per chart (per stream)
   FETCH_TIMEOUT_MS: 3000,
-  REALTIME_GOOD_RATIO: 0.9, // processed/received >= this -> "Real-time"
-  REALTIME_WARN_RATIO: 0.7, // >= this -> "Near real-time", below -> "Falling behind"
+  SHIFT_RATE_WINDOW: 10,     // trailing edge samples used for the content-shift rolling rate
+  STATUS_LOOKBACK: 5,        // trailing edge samples used for the content-shift status badge
 };
 // ============================================================
 
@@ -277,82 +293,61 @@ function formatCompact(n) {
   return Math.round(n).toLocaleString();
 }
 
-// ---- shared rolling window state ----
-// every chart indexes into the same `labels` array so one poll = one column everywhere
-const state = {
-  labels: [],
-  cpu: [], mem: [], gpu: [],
-  hasGpu: null, // becomes true/false once we see the field (or don't) on a live sample
-  inferenceFps: [], receivedFps: [], processedFps: [], filteredFps: [],
-  latencyAvg: [], latencyP95: [],
-  filterRatePct: [],
-  bandwidth: [],
-  prevSnapshot: null, // {timestamp, frames_received, frames_filtered, total_frames_processed}
+function numOrNull(v) {
+  return v === null || v === undefined ? null : v;
+}
+
+// ---- server response shape ----
+// GET /metrics/data -> { edge: [...edge-pushed records], cloud: [...locally sampled records] }
+// The two streams have independent cadences (edge pushes every 15 frames of
+// video; cloud samples once a second) and independent field sets, so each
+// gets its own rolling-window state and its own x-axis labels.
+const cloudState = { labels: [], cpuPercent: [], memPercent: [], procCpu: [], raw: [] };
+const edgeState = {
+  labels: [], edgeCpu: [], edgeMem: [],
+  throughputFps: [], objectsInFrame: [], uniqueTotal: [],
+  endToEnd: [], roundTrip: [], inference: [], network: [],
+  bandwidthMbps: [], shiftRate: [], raw: [],
 };
 
-const rollingArrays = () => [
-  state.labels, state.cpu, state.mem, state.gpu,
-  state.inferenceFps, state.receivedFps, state.processedFps, state.filteredFps,
-  state.latencyAvg, state.latencyP95, state.filterRatePct, state.bandwidth,
-];
-
-function pushSample(label, values) {
-  state.labels.push(label);
-  state.cpu.push(values.cpu ?? null);
-  state.mem.push(values.mem ?? null);
-  state.gpu.push(values.gpu ?? null);
-  state.inferenceFps.push(values.inferenceFps ?? null);
-  state.receivedFps.push(values.receivedFps ?? null);
-  state.processedFps.push(values.processedFps ?? null);
-  state.filteredFps.push(values.filteredFps ?? null);
-  state.latencyAvg.push(values.latencyAvg ?? null);
-  state.latencyP95.push(values.latencyP95 ?? null);
-  state.filterRatePct.push(values.filterRatePct ?? null);
-  state.bandwidth.push(values.bandwidth ?? null);
-
-  if (state.labels.length > CONFIG.WINDOW_SIZE) {
-    rollingArrays().forEach((arr) => arr.shift());
-  }
+// server already retains history (deque maxlen=300) — every poll returns the
+// full window, so we just re-slice it rather than incrementally appending
+function fillSeries(stateObj, records, windowSize, mapping) {
+  const trimmed = (records || []).slice(-windowSize);
+  stateObj.labels = trimmed.map((r) => formatTime(r.ts));
+  stateObj.raw = trimmed;
+  Object.entries(mapping).forEach(([key, fn]) => {
+    stateObj[key] = trimmed.map(fn);
+  });
 }
 
-// cumulative counters only ever go up; a drop means the pipeline restarted,
-// so that interval's rate is unmeasurable and we just re-baseline on it
-function computeRates(curr, prev) {
-  const nullRates = { receivedFps: null, processedFps: null, filteredFps: null, filterRatePct: null };
-  if (!prev) return nullRates;
-  const dt = curr.timestamp - prev.timestamp;
-  const dReceived = curr.frames_received - prev.frames_received;
-  const dFiltered = curr.frames_filtered - prev.frames_filtered;
-  const dProcessed = curr.total_frames_processed - prev.total_frames_processed;
-  if (![dt, dReceived, dFiltered, dProcessed].every(Number.isFinite) || dt <= 0
-      || dReceived < 0 || dFiltered < 0 || dProcessed < 0) {
-    return nullRates;
-  }
-  return {
-    receivedFps: dReceived / dt,
-    processedFps: dProcessed / dt,
-    filteredFps: dFiltered / dt,
-    filterRatePct: dReceived > 0 ? (dFiltered / dReceived) * 100 : null,
-  };
+// % of the trailing SHIFT_RATE_WINDOW edge samples flagged content_shift_detected
+function rollingShiftRate(records, window) {
+  return records.map((_, i) => {
+    const start = Math.max(0, i - window + 1);
+    const slice = records.slice(start, i + 1);
+    const flagged = slice.filter((r) => r.content_shift_detected).length;
+    return (flagged / slice.length) * 100;
+  });
 }
 
-function pipelineStatus() {
-  let sumReceived = 0, sumProcessed = 0, n = 0;
-  for (let i = state.labels.length - 1; i >= 0 && n < 5; i--) {
-    const r = state.receivedFps[i], p = state.processedFps[i];
-    if (r !== null && p !== null) { sumReceived += r; sumProcessed += p; n++; }
-  }
-  if (n === 0 || sumReceived === 0) return null;
-  const ratio = sumProcessed / sumReceived;
-  if (ratio >= CONFIG.REALTIME_GOOD_RATIO) return { tier: "good", label: "✓ Real-time" };
-  if (ratio >= CONFIG.REALTIME_WARN_RATIO) return { tier: "warning", label: "~ Near real-time" };
-  return { tier: "critical", label: "! Falling behind" };
+function latestEdge() {
+  return edgeState.raw.length ? edgeState.raw[edgeState.raw.length - 1] : null;
+}
+
+function contentShiftStatus() {
+  const recs = edgeState.raw.slice(-CONFIG.STATUS_LOOKBACK);
+  if (!recs.length) return null;
+  const flagged = recs.filter((r) => r.content_shift_detected).length;
+  if (flagged === 0) return { tier: "good", label: "✓ Stable" };
+  if (flagged === 1) return { tier: "warning", label: "~ Shift detected" };
+  return { tier: "critical", label: "! Frequent shifts" };
 }
 
 // ---- Chart.js setup ----
 Chart.defaults.font.family = "system-ui, -apple-system, 'Segoe UI', sans-serif";
 
-function baseDataset(label, key, color) {
+function baseDataset(label, key, color, yAxisID) {
   return {
     label,
     data: [],
@@ -366,6 +361,7 @@ function baseDataset(label, key, color) {
     pointHoverRadius: 4,
     pointHitRadius: 12,
     spanGaps: false, // a gap in data should show as a visible gap, not a bridged line
+    yAxisID: yAxisID || "y",
     _key: key,
   };
 }
@@ -377,34 +373,46 @@ function makeChart(canvasId, datasetsSpec, opts = {}) {
   const textMuted = cssVar("--text-muted");
   const textSecondary = cssVar("--text-secondary");
 
+  const scales = {
+    x: {
+      grid: { color: gridline, drawTicks: false },
+      border: { color: axisColor },
+      ticks: { color: textMuted, maxTicksLimit: 8, maxRotation: 0 },
+    },
+    y: {
+      grid: { color: gridline, drawTicks: false },
+      border: { color: axisColor },
+      ticks: { color: textMuted },
+      beginAtZero: true,
+      ...(opts.yMax ? { max: opts.yMax } : {}),
+      title: opts.yTitle
+        ? { display: true, text: opts.yTitle, color: textSecondary, font: { size: 11 } }
+        : undefined,
+    },
+  };
+  if (opts.y1Title) {
+    scales.y1 = {
+      position: "right",
+      grid: { display: false },
+      border: { color: axisColor },
+      ticks: { color: textMuted },
+      beginAtZero: true,
+      title: { display: true, text: opts.y1Title, color: textSecondary, font: { size: 11 } },
+    };
+  }
+
   const chart = new Chart(ctx, {
     type: "line",
     data: {
       labels: [],
-      datasets: datasetsSpec.map((d) => baseDataset(d.label, d.key, cssVar(d.colorVar))),
+      datasets: datasetsSpec.map((d) => baseDataset(d.label, d.key, cssVar(d.colorVar), d.yAxisID)),
     },
     options: {
       responsive: true,
       maintainAspectRatio: false,
       animation: false,
       interaction: { mode: "index", intersect: false },
-      scales: {
-        x: {
-          grid: { color: gridline, drawTicks: false },
-          border: { color: axisColor },
-          ticks: { color: textMuted, maxTicksLimit: 8, maxRotation: 0 },
-        },
-        y: {
-          grid: { color: gridline, drawTicks: false },
-          border: { color: axisColor },
-          ticks: { color: textMuted },
-          beginAtZero: true,
-          ...(opts.yMax ? { max: opts.yMax } : {}),
-          title: opts.yTitle
-            ? { display: true, text: opts.yTitle, color: textSecondary, font: { size: 11 } }
-            : undefined,
-        },
-      },
+      scales,
       plugins: {
         legend: {
           display: datasetsSpec.length > 1,
@@ -424,69 +432,100 @@ function makeChart(canvasId, datasetsSpec, opts = {}) {
   return chart;
 }
 
-const charts = {
-  resource: makeChart("chart-resource", [
-    { label: "CPU %", key: "cpu", colorVar: "--series-1" },
-    { label: "Memory %", key: "mem", colorVar: "--series-2" },
-    { label: "GPU %", key: "gpu", colorVar: "--series-3" },
-  ], { yMax: 100, yTitle: "%" }),
-
-  throughput: makeChart("chart-throughput", [
-    { label: "Inference (reported)", key: "inferenceFps", colorVar: "--series-1" },
-    { label: "Received", key: "receivedFps", colorVar: "--series-2" },
-    { label: "Processed", key: "processedFps", colorVar: "--series-3" },
-    { label: "Filtered", key: "filteredFps", colorVar: "--series-4" },
-  ], { yTitle: "frames / sec" }),
-
-  latency: makeChart("chart-latency", [
-    { label: "Average", key: "latencyAvg", colorVar: "--series-1" },
-    { label: "p95", key: "latencyP95", colorVar: "--series-2" },
-  ], { yTitle: "ms" }),
-
-  filterrate: makeChart("chart-filterrate", [
-    { label: "Filter rate", key: "filterRatePct", colorVar: "--series-1" },
-  ], { yMax: 100, yTitle: "%" }),
-
-  bandwidth: makeChart("chart-bandwidth", [
-    { label: "Bandwidth", key: "bandwidth", colorVar: "--series-1" },
-  ], { yTitle: "kbps" }),
+// key -> which rolling-window state feeds it, which canvas/series it renders,
+// and (reused for the "view as table" twin) the column labels for each series
+const CHART_DEFS = {
+  resource: {
+    state: cloudState,
+    canvas: "chart-resource",
+    series: [
+      { label: "Cloud CPU %", key: "cpuPercent", colorVar: "--series-1" },
+      { label: "Cloud Memory %", key: "memPercent", colorVar: "--series-2" },
+      { label: "Process CPU %", key: "procCpu", colorVar: "--series-3" },
+    ],
+    opts: { yMax: 100, yTitle: "%" },
+  },
+  edgeResource: {
+    state: edgeState,
+    canvas: "chart-edge-resource",
+    series: [
+      { label: "Edge CPU %", key: "edgeCpu", colorVar: "--series-1" },
+      { label: "Edge Memory %", key: "edgeMem", colorVar: "--series-2" },
+    ],
+    opts: { yMax: 100, yTitle: "%" },
+  },
+  throughput: {
+    state: edgeState,
+    canvas: "chart-throughput",
+    series: [
+      { label: "Throughput", key: "throughputFps", colorVar: "--series-1" },
+    ],
+    opts: { yTitle: "frames / sec" },
+  },
+  objects: {
+    state: edgeState,
+    canvas: "chart-objects",
+    series: [
+      { label: "Objects in frame", key: "objectsInFrame", colorVar: "--series-1" },
+      { label: "Unique tracked (total)", key: "uniqueTotal", colorVar: "--series-3", yAxisID: "y1" },
+    ],
+    opts: { yTitle: "objects / frame", y1Title: "unique total" },
+  },
+  latency: {
+    state: edgeState,
+    canvas: "chart-latency",
+    series: [
+      { label: "End-to-end", key: "endToEnd", colorVar: "--series-1" },
+      { label: "Round trip", key: "roundTrip", colorVar: "--series-2" },
+      { label: "Inference", key: "inference", colorVar: "--series-3" },
+      { label: "Network", key: "network", colorVar: "--series-4" },
+    ],
+    opts: { yTitle: "ms" },
+  },
+  contentshift: {
+    state: edgeState,
+    canvas: "chart-contentshift",
+    series: [
+      { label: "Content-shift rate", key: "shiftRate", colorVar: "--series-1" },
+    ],
+    opts: { yMax: 100, yTitle: "%" },
+  },
+  bandwidth: {
+    state: edgeState,
+    canvas: "chart-bandwidth",
+    series: [
+      { label: "Bandwidth", key: "bandwidthMbps", colorVar: "--series-1" },
+    ],
+    opts: { yTitle: "Mbps" },
+  },
 };
 
+const charts = {};
+Object.entries(CHART_DEFS).forEach(([key, def]) => {
+  charts[key] = makeChart(def.canvas, def.series, def.opts || {});
+});
+
 function redrawCharts() {
-  Object.values(charts).forEach((chart) => {
-    chart.data.labels = state.labels;
-    chart.data.datasets.forEach((ds) => { ds.data = state[ds._key]; });
+  Object.entries(CHART_DEFS).forEach(([key, def]) => {
+    const chart = charts[key];
+    chart.data.labels = def.state.labels;
+    chart.data.datasets.forEach((ds) => { ds.data = def.state[ds._key]; });
     chart.update("none");
   });
 }
 
-// GPU series is optional hardware — hide it entirely if the field never shows up
-function setGpuVisibility(visible) {
-  const ds = charts.resource.data.datasets.find((d) => d._key === "gpu");
-  ds.hidden = !visible;
-  charts.resource.update("none");
-}
-
 // ---- table-view twins (accessibility) ----
-const TABLE_SPECS = {
-  resource: [["CPU %", "cpu"], ["Memory %", "mem"], ["GPU %", "gpu"]],
-  throughput: [["Inference fps", "inferenceFps"], ["Received fps", "receivedFps"], ["Processed fps", "processedFps"], ["Filtered fps", "filteredFps"]],
-  latency: [["Avg ms", "latencyAvg"], ["p95 ms", "latencyP95"]],
-  filterrate: [["Filter %", "filterRatePct"]],
-  bandwidth: [["kbps", "bandwidth"]],
-};
-
-function renderTable(targetKey) {
-  const el = document.getElementById(`table-${targetKey}`);
-  const cols = TABLE_SPECS[targetKey];
-  const rows = state.labels.map((label, i) => {
-    const cells = cols.map(([, key]) => {
-      const v = state[key][i];
+function renderTable(key) {
+  const def = CHART_DEFS[key];
+  const el = document.getElementById(`table-${key}`);
+  const rows = def.state.labels.map((label, i) => {
+    const cells = def.series.map((s) => {
+      const v = def.state[s.key][i];
       return `<td>${v === null || v === undefined ? "—" : (Math.round(v * 10) / 10).toLocaleString()}</td>`;
     }).join("");
     return `<tr><td>${label}</td>${cells}</tr>`;
   }).reverse().join("");
-  const head = cols.map(([name]) => `<th>${name}</th>`).join("");
+  const head = def.series.map((s) => `<th>${s.label}</th>`).join("");
   el.innerHTML = `<table><thead><tr><th>Time</th>${head}</tr></thead><tbody>${rows}</tbody></table>`;
 }
 
@@ -508,18 +547,19 @@ const statRate = document.getElementById("stat-rate");
 const statStatus = document.getElementById("stat-status");
 const statStatusSub = document.getElementById("stat-status-sub");
 
-function updateStatCards(data, rates) {
-  statTotal.textContent = formatCompact(data.total_frames_processed);
-  statInflight.textContent = formatCompact(data.in_flight_requests);
-  statRate.textContent = rates.processedFps !== null
-    ? `${rates.processedFps.toFixed(1)} fps`
+function updateStatCards() {
+  const e = latestEdge();
+  statTotal.textContent = e ? formatCompact(e.frame) : "—";
+  statInflight.textContent = e ? formatCompact(e.unique_total) : "—";
+  statRate.textContent = e && e.throughput_fps !== null && e.throughput_fps !== undefined
+    ? `${e.throughput_fps.toFixed(1)} fps`
     : "—";
 
-  const status = pipelineStatus();
+  const status = contentShiftStatus();
   statStatus.className = "value" + (status ? ` status-${status.tier}` : "");
   statStatus.textContent = status ? status.label : "—";
   statStatusSub.textContent = status
-    ? "processed vs. incoming rate (last 5 samples)"
+    ? `frame-diff vs. rolling baseline (last ${CONFIG.STATUS_LOOKBACK} samples)`
     : "waiting for enough samples";
 }
 
@@ -528,8 +568,6 @@ const connIndicator = document.getElementById("conn-indicator");
 const connText = document.getElementById("conn-text");
 const connUpdated = document.getElementById("conn-updated");
 const staleBanner = document.getElementById("stale-banner");
-const statRow = document.getElementById("stat-row");
-const chartGrids = document.querySelectorAll(".chart-grid");
 
 let consecutiveFailures = 0;
 let lastSuccessAt = null;
@@ -562,37 +600,36 @@ async function fetchMetrics() {
 
 function handleSample(data) {
   consecutiveFailures = 0;
-  lastSuccessAt = data.timestamp ?? Date.now() / 1000;
+
+  const edgeRecs = Array.isArray(data.edge) ? data.edge : [];
+  const cloudRecs = Array.isArray(data.cloud) ? data.cloud : [];
+
+  const latestEdgeTs = edgeRecs.length ? edgeRecs[edgeRecs.length - 1].ts : null;
+  const latestCloudTs = cloudRecs.length ? cloudRecs[cloudRecs.length - 1].ts : null;
+  lastSuccessAt = Math.max(latestEdgeTs || 0, latestCloudTs || 0) || Date.now() / 1000;
   setConnectionState("live");
 
-  if (state.hasGpu === null) {
-    state.hasGpu = data.gpu_percent !== null && data.gpu_percent !== undefined;
-    setGpuVisibility(state.hasGpu);
-  }
-
-  const rates = computeRates(data, state.prevSnapshot);
-  state.prevSnapshot = {
-    timestamp: data.timestamp,
-    frames_received: data.frames_received,
-    frames_filtered: data.frames_filtered,
-    total_frames_processed: data.total_frames_processed,
-  };
-
-  pushSample(formatTime(lastSuccessAt), {
-    cpu: data.cpu_percent,
-    mem: data.memory_percent,
-    gpu: state.hasGpu ? data.gpu_percent : null,
-    inferenceFps: data.inference_fps,
-    receivedFps: rates.receivedFps,
-    processedFps: rates.processedFps,
-    filteredFps: rates.filteredFps,
-    latencyAvg: data.latency_ms_avg,
-    latencyP95: data.latency_ms_p95,
-    filterRatePct: rates.filterRatePct,
-    bandwidth: data.bandwidth_kbps,
+  fillSeries(cloudState, cloudRecs, CONFIG.WINDOW_SIZE, {
+    cpuPercent: (r) => numOrNull(r.cpu_percent),
+    memPercent: (r) => numOrNull(r.mem_percent),
+    procCpu: (r) => numOrNull(r.proc_cpu),
   });
 
-  updateStatCards(data, rates);
+  fillSeries(edgeState, edgeRecs, CONFIG.WINDOW_SIZE, {
+    edgeCpu: (r) => numOrNull(r.edge_cpu),
+    edgeMem: (r) => numOrNull(r.edge_mem),
+    throughputFps: (r) => numOrNull(r.throughput_fps),
+    objectsInFrame: (r) => numOrNull(r.objects_in_frame),
+    uniqueTotal: (r) => numOrNull(r.unique_total),
+    endToEnd: (r) => numOrNull(r.end_to_end_ms),
+    roundTrip: (r) => numOrNull(r.round_trip_ms),
+    inference: (r) => numOrNull(r.inference_ms),
+    network: (r) => numOrNull(r.network_ms),
+    bandwidthMbps: (r) => numOrNull(r.bandwidth_mbps),
+  });
+  edgeState.shiftRate = rollingShiftRate(edgeState.raw, CONFIG.SHIFT_RATE_WINDOW);
+
+  updateStatCards();
   redrawCharts();
   document.querySelectorAll(".data-table.open").forEach((el) => {
     renderTable(el.id.replace("table-", ""));
@@ -602,10 +639,8 @@ function handleSample(data) {
 function handleFailure() {
   consecutiveFailures += 1;
   setConnectionState(consecutiveFailures > 0 && lastSuccessAt ? "reconnecting" : "connecting");
-  // record a gap so the lines visibly break during the outage instead of
-  // silently flat-lining or bridging over missing time
-  pushSample(formatTime(Date.now() / 1000), {});
-  redrawCharts();
+  // the server is the source of truth for history, so on a failed poll we
+  // simply stop refreshing — charts/stat cards freeze on last-known values
 }
 
 async function pollLoop() {

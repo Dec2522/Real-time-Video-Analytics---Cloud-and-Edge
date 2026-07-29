@@ -15,6 +15,12 @@ import threading
 app = Flask(__name__)
 model = YOLO("yolo11n.pt")
 
+
+@app.after_request
+def add_cors_headers(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
 # --- rolling stores for the dashboard (last N samples) ---
 edge_metrics_history = deque(maxlen=300)    # pushed from the edge
 cloud_metrics_history = deque(maxlen=300)   # sampled locally
@@ -93,4 +99,4 @@ def metrics_data():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    app.run(host="0.0.0.0", port=8000, threaded=True)
