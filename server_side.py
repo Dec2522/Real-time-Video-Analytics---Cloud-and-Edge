@@ -7,6 +7,11 @@ import time
 from collections import deque
 import threading
 
+# look up metrics
+# add a queue
+# dash board
+# more than one stream
+
 app = Flask(__name__)
 model = YOLO("yolo11n.pt")
 
@@ -43,10 +48,12 @@ def detect():
     jpg_bytes = request.data
     arr = np.frombuffer(jpg_bytes, dtype=np.uint8)
     frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    decode_ms = (time.time() - t0) * 1000
 
+    t1 = time.time()
     results = model.track(frame, persist=True, conf=0.3, verbose=False,
                           classes=[2, 3, 5, 7])
-    inference_ms = (time.time() - t0) * 1000
+    inference_ms = (time.time() - t1) * 1000
 
     boxes = results[0].boxes
     dets = []
@@ -61,7 +68,8 @@ def detect():
 
     return jsonify({
         "detections": dets,
-        "inference_ms": round(inference_ms, 1),   # cloud-side compute time for THIS frame
+        "decode_ms": round(decode_ms, 1),          # cloud-side JPEG decode time
+        "inference_ms": round(inference_ms, 1),    # cloud-side compute time for THIS frame
     })
 
 
