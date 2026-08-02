@@ -20,41 +20,10 @@
     --series-2: #eb6834; /* orange */
     --series-3: #1baf7a; /* aqua   */
     --series-4: #eda100; /* yellow */
+    --series-5: #8a63d2; /* purple */
     --status-good:     #0ca30c;
     --status-warning:  #fab219;
     --status-critical: #d03b3b;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root:where(:not([data-theme="light"])) {
-      color-scheme: dark;
-      --surface-1:      #1a1a19;
-      --page-plane:     #0d0d0d;
-      --text-primary:   #ffffff;
-      --text-secondary: #c3c2b7;
-      --text-muted:     #898781;
-      --gridline:       #2c2c2a;
-      --axis:           #383835;
-      --border:         rgba(255,255,255,0.10);
-      --series-1: #3987e5;
-      --series-2: #d95926;
-      --series-3: #199e70;
-      --series-4: #c98500;
-    }
-  }
-  :root[data-theme="dark"] {
-    color-scheme: dark;
-    --surface-1:      #1a1a19;
-    --page-plane:     #0d0d0d;
-    --text-primary:   #ffffff;
-    --text-secondary: #c3c2b7;
-    --text-muted:     #898781;
-    --gridline:       #2c2c2a;
-    --axis:           #383835;
-    --border:         rgba(255,255,255,0.10);
-    --series-1: #3987e5;
-    --series-2: #d95926;
-    --series-3: #199e70;
-    --series-4: #c98500;
   }
 
   * { box-sizing: border-box; }
@@ -105,6 +74,17 @@
   .stat-card .value.status-warning { color: var(--status-warning); }
   .stat-card .value.status-critical { color: var(--status-critical); }
   .stat-card .sub { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+
+  /* stream legend chips inside the streams tile */
+  .stream-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .stream-chip {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11px; color: var(--text-secondary);
+    border: 1px solid var(--border); border-radius: 999px; padding: 2px 8px;
+    font-variant-numeric: tabular-nums;
+  }
+  .stream-chip .swatch { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+  .stream-chip.idle { opacity: 0.45; }
 
   .chart-grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
   .chart-grid.cols-2 { grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); }
@@ -176,27 +156,33 @@
   <section>
     <div class="stat-row" id="stat-row">
       <div class="stat-card">
+        <div class="label">Video streams</div>
+        <div class="value" id="stat-streams">-</div>
+        <div class="sub" id="stat-streams-sub">concurrent streams in flight</div>
+        <div class="stream-chips" id="stream-chips"></div>
+      </div>
+      <div class="stat-card">
         <div class="label">Total frames processed</div>
-        <div class="value" id="stat-total">—</div>
-        <div class="sub">cumulative since pipeline start</div>
+        <div class="value" id="stat-total">-</div>
+        <div class="sub" id="stat-total-sub">cumulative across all streams</div>
       </div>
       <div class="stat-card">
         <div class="label">Unique objects tracked</div>
-        <div class="value" id="stat-inflight">—</div>
-        <div class="sub">distinct track IDs seen so far</div>
+        <div class="value" id="stat-inflight">-</div>
+        <div class="sub">distinct track IDs, summed over streams</div>
       </div>
       <div class="stat-card">
-        <div class="label">Processing rate</div>
-        <div class="value" id="stat-rate">—</div>
-        <div class="sub">frames/sec, reported by the edge</div>
+        <div class="label">Aggregate processing rate</div>
+        <div class="value" id="stat-rate">-</div>
+        <div class="sub" id="stat-rate-sub">frames/sec, all streams combined</div>
       </div>
       <div class="stat-card">
         <div class="label">Content-shift status</div>
-        <div class="value" id="stat-status">—</div>
+        <div class="value" id="stat-status">-</div>
         <div class="sub" id="stat-status-sub">frame-diff vs. rolling baseline</div>
       </div>
     </div>
-    <div class="stale-banner" id="stale-banner">Not receiving fresh data — showing last known values.</div>
+    <div class="stale-banner" id="stale-banner">Not receiving fresh data - showing last known values.</div>
   </section>
 
   <section>
@@ -220,6 +206,14 @@
       </div>
       <div class="chart-card">
         <div class="card-head">
+          <h3>Cloud concurrency</h3>
+          <button class="table-toggle" data-target="concurrency">View as table</button>
+        </div>
+        <div class="canvas-wrap"><canvas id="chart-concurrency"></canvas></div>
+        <div class="data-table" id="table-concurrency"></div>
+      </div>
+      <div class="chart-card">
+        <div class="card-head">
           <h3>Per-core CPU</h3>
           <span class="note" id="percore-note"></span>
         </div>
@@ -229,7 +223,7 @@
   </section>
 
   <section>
-    <h2>Application performance</h2>
+    <h2>Application performance <span id="perstream-note" style="font-weight:400;text-transform:none;letter-spacing:0"></span></h2>
     <div class="chart-grid cols-2">
       <div class="chart-card">
         <div class="card-head">
@@ -241,7 +235,15 @@
       </div>
       <div class="chart-card">
         <div class="card-head">
-          <h3>Objects detected</h3>
+          <h3>End-to-end latency</h3>
+          <button class="table-toggle" data-target="latency">View as table</button>
+        </div>
+        <div class="canvas-wrap"><canvas id="chart-latency"></canvas></div>
+        <div class="data-table" id="table-latency"></div>
+      </div>
+      <div class="chart-card">
+        <div class="card-head">
+          <h3>Objects in frame</h3>
           <button class="table-toggle" data-target="objects">View as table</button>
         </div>
         <div class="canvas-wrap"><canvas id="chart-objects"></canvas></div>
@@ -249,11 +251,10 @@
       </div>
       <div class="chart-card">
         <div class="card-head">
-          <h3>Latency breakdown (ms)</h3>
-          <button class="table-toggle" data-target="latency">View as table</button>
+          <h3>Latency breakdown by stream</h3>
+          <span class="note">mean over window (ms)</span>
         </div>
-        <div class="canvas-wrap"><canvas id="chart-latency"></canvas></div>
-        <div class="data-table" id="table-latency"></div>
+        <div class="canvas-wrap"><canvas id="chart-breakdown"></canvas></div>
       </div>
     </div>
   </section>
@@ -284,7 +285,7 @@
 
 <script>
 // ============================================================
-// CONFIG — the only place you should need to edit
+// CONFIG - the only place you should need to edit
 // ============================================================
 const CONFIG = {
   METRICS_URL: "http://localhost:8000/metrics/data",
@@ -296,52 +297,65 @@ const CONFIG = {
 };
 // ============================================================
 
+
+// HELPER FUNCTIONS
+
+// Function passes CSS to JavaScipt charts
 function cssVar(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
 
+// Format unix into `HH:MM:SS` - used for chart time X-axes
 function formatTime(unixSeconds) {
   const d = new Date(unixSeconds * 1000);
+  // Pad single digits with leading 0
   const p = (n) => String(n).padStart(2, "0");
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
+// Format numbers into a presentable format
+// Null: `-`, 1200000: `1.2M`, 1500: `1.5K`
 function formatCompact(n) {
-  if (n === null || n === undefined || Number.isNaN(n)) return "—";
+  if (n === null || n === undefined || Number.isNaN(n)) return "-";
   if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
   if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
   return Math.round(n).toLocaleString();
 }
 
+// Return `null` if missing values
 function numOrNull(v) {
   return v === null || v === undefined ? null : v;
 }
 
-// ---- server response shape ----
-// GET /metrics/data -> { edge: [...edge-pushed records], cloud: [...locally sampled records] }
-// The two streams have independent cadences (edge pushes every 15 frames of
-// video; cloud samples once a second) and independent field sets, so each
-// gets its own rolling-window state and its own x-axis labels.
-const cloudState = { labels: [], cpuPercent: [], memPercent: [], procCpu: [], raw: [] };
-const edgeState = {
-  labels: [], edgeCpu: [], edgeMem: [],
-  throughputFps: [], objectsInFrame: [], uniqueTotal: [],
-  endToEnd: [], roundTrip: [], inference: [], network: [],
-  bandwidthMbps: [], shiftRate: [], raw: [],
-};
-
-// server already retains history (deque maxlen=300) — every poll returns the
-// full window, so we just re-slice it rather than incrementally appending
-function fillSeries(stateObj, records, windowSize, mapping) {
-  const trimmed = (records || []).slice(-windowSize);
-  stateObj.labels = trimmed.map((r) => formatTime(r.ts));
-  stateObj.raw = trimmed;
-  Object.entries(mapping).forEach(([key, fn]) => {
-    stateObj[key] = trimmed.map(fn);
-  });
+// Return mean, ignoring NaNs
+function mean(values) {
+  const nums = values.filter((v) => typeof v === "number" && !Number.isNaN(v));
+  return nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : 0;
 }
 
-// % of the trailing SHIFT_RATE_WINDOW edge samples flagged content_shift_detected
+// Dashboard memory
+const state = {
+  cloud: [],                 // trimmed cloud samples
+  streams: new Map(),        // map lookup
+  streamMeta: [],            // server-reported stream roster
+};
+
+const seenStreamIds = new Set(); 
+
+// Return stream IDs sorted numerically - used for consistent chart colours
+function streamIds() {
+  return [...state.streams.keys()].sort((a, b) => String(a).localeCompare(String(b), undefined, { numeric: true }));
+}
+
+// First 4 streams have fixed colours, any more and this is auto generated 
+const PALETTE = ["--series-1", "--series-2", "--series-3", "--series-4", "--series-5"];
+function streamColor(index) {
+  if (index < PALETTE.length) return cssVar(PALETTE[index]);
+  const hue = (index * 47) % 360;              // 47 keeps successive hues far apart
+  return `hsl(${hue} 65% 52%)`;
+}
+
+// % of frames where a content shift was detected, over a trailing window
 function rollingShiftRate(records, window) {
   return records.map((_, i) => {
     const start = Math.max(0, i - window + 1);
@@ -351,31 +365,46 @@ function rollingShiftRate(records, window) {
   });
 }
 
-function latestEdge() {
-  return edgeState.raw.length ? edgeState.raw[edgeState.raw.length - 1] : null;
+// Get latest record from an array
+function latestOf(records) {
+  return records && records.length ? records[records.length - 1] : null;
 }
 
+// All steams return the cloud and edge resource metrics, so pick the stream with the most samples to present
+function busiestStreamRecords() {
+  let best = [];
+  for (const recs of state.streams.values()) {
+    if (recs.length > best.length) best = recs;
+  }
+  return best;
+}
+
+// Return status based on how many recent samples were flagged, across all streams
 function contentShiftStatus() {
-  const recs = edgeState.raw.slice(-CONFIG.STATUS_LOOKBACK);
-  if (!recs.length) return null;
-  const flagged = recs.filter((r) => r.content_shift_detected).length;
+  const recent = [];
+  for (const recs of state.streams.values()) {
+    recent.push(...recs.slice(-CONFIG.STATUS_LOOKBACK));
+  }
+  if (!recent.length) return null;
+  const flagged = recent.filter((r) => r.content_shift_detected).length;
   if (flagged === 0) return { tier: "good", label: "✓ Stable" };
-  if (flagged === 1) return { tier: "warning", label: "~ Shift detected" };
+  if (flagged <= Math.max(1, state.streams.size)) return { tier: "warning", label: "~ Shift detected" };
   return { tier: "critical", label: "! Frequent shifts" };
 }
 
-// ---- per-core CPU boxes ----
-// green (low) -> amber (mid) -> red (high), interpolated for a 0-100 load
+// --- --- Per core usage percentage visual --- ---
+// Colour code each box: green (low), amber (medium), red (max)
+// Uses interpolation to get colour
 function loadColor(pct) {
   const p = Math.max(0, Math.min(100, pct)) / 100;
   let r, g, b;
   if (p < 0.5) {
-    const t = p / 0.5;                       // green (16,163,16) -> amber (250,178,25)
+    const t = p / 0.5;                       // green (16,163,16) to amber (250,178,25)
     r = Math.round(16  + t * (250 - 16));
     g = Math.round(163 + t * (178 - 163));
     b = Math.round(16  + t * (25  - 16));
   } else {
-    const t = (p - 0.5) / 0.5;               // amber (250,178,25) -> red (208,59,59)
+    const t = (p - 0.5) / 0.5;               // amber (250,178,25) to red (208,59,59)
     r = Math.round(250 + t * (208 - 250));
     g = Math.round(178 + t * (59  - 178));
     b = Math.round(25  + t * (59  - 25));
@@ -383,19 +412,21 @@ function loadColor(pct) {
   return `rgb(${r},${g},${b})`;
 }
 
+// Get HTML elements for per core grid
 const perCoreGrid = document.getElementById("percore-grid");
 const perCoreNote = document.getElementById("percore-note");
 
 function renderPerCore(cores) {
   if (!Array.isArray(cores) || !cores.length) return;
-  // build the boxes once, then only recolour/relabel on subsequent polls
+  // build the boxes once (when number of boxes doesn't equal number of cores i.e the start)
   if (perCoreGrid.children.length !== cores.length) {
     perCoreGrid.innerHTML = cores.map((_, i) =>
       `<div class="core-box" data-core="${i}">
          <div class="core-lbl">core ${i}</div>
-         <div class="core-val">—</div>
+         <div class="core-val">-</div>
        </div>`).join("");
   }
+  // Update values and colours
   cores.forEach((pct, i) => {
     const box = perCoreGrid.children[i];
     box.style.background = loadColor(pct);
@@ -405,10 +436,12 @@ function renderPerCore(cores) {
   perCoreNote.textContent = `${cores.length} cores · avg ${Math.round(avg)}%`;
 }
 
-// ---- Chart.js setup ----
+// --- --- Chart.js setup --- ---
 Chart.defaults.font.family = "system-ui, -apple-system, 'Segoe UI', sans-serif";
 
-function baseDataset(label, key, color, yAxisID) {
+// Config for a line on a chart - its label, colour, and aesthetic.
+// Data is filled in later as {x: unix ts, y: value} points.
+function baseDataset(label, color, yAxisID) {
   return {
     label,
     data: [],
@@ -423,22 +456,26 @@ function baseDataset(label, key, color, yAxisID) {
     pointHitRadius: 12,
     spanGaps: false, // a gap in data should show as a visible gap, not a bridged line
     yAxisID: yAxisID || "y",
-    _key: key,
   };
 }
 
-function makeChart(canvasId, datasetsSpec, opts = {}) {
+// Config for a time-series chart
+function makeChart(canvasId, opts = {}) {
   const ctx = document.getElementById(canvasId).getContext("2d");
   const gridline = cssVar("--gridline");
   const axisColor = cssVar("--axis");
   const textMuted = cssVar("--text-muted");
   const textSecondary = cssVar("--text-secondary");
-
+  // Config for X and Y
   const scales = {
     x: {
+      type: "linear",                        
       grid: { color: gridline, drawTicks: false },
       border: { color: axisColor },
-      ticks: { color: textMuted, maxTicksLimit: 8, maxRotation: 0 },
+      ticks: {
+        color: textMuted, maxTicksLimit: 8, maxRotation: 0,
+        callback: (v) => formatTime(v),
+      },
     },
     y: {
       grid: { color: gridline, drawTicks: false },
@@ -461,22 +498,21 @@ function makeChart(canvasId, datasetsSpec, opts = {}) {
       title: { display: true, text: opts.y1Title, color: textSecondary, font: { size: 11 } },
     };
   }
-
-  const chart = new Chart(ctx, {
+  // Build chart with above config
+  return new Chart(ctx, {
     type: "line",
-    data: {
-      labels: [],
-      datasets: datasetsSpec.map((d) => baseDataset(d.label, d.key, cssVar(d.colorVar), d.yAxisID)),
-    },
+    data: { datasets: [] },
+    // Ancillary options - responsiveness, animation, interaction, scales, plugins
     options: {
       responsive: true,
       maintainAspectRatio: false,
       animation: false,
-      interaction: { mode: "index", intersect: false },
+      parsing: false,                   
+      interaction: { mode: "nearest", axis: "x", intersect: false },
       scales,
       plugins: {
         legend: {
-          display: datasetsSpec.length > 1,
+          display: true,
           labels: { color: textSecondary, boxWidth: 16, boxHeight: 2, usePointStyle: false },
         },
         tooltip: {
@@ -486,110 +522,232 @@ function makeChart(canvasId, datasetsSpec, opts = {}) {
           borderColor: cssVar("--border"),
           borderWidth: 1,
           padding: 8,
+          callbacks: {
+            title: (items) => (items.length ? formatTime(items[0].parsed.x) : ""),
+          },
         },
       },
     },
   });
-  return chart;
 }
 
-// key -> which rolling-window state feeds it, which canvas/series it renders,
-// and (reused for the "view as table" twin) the column labels for each series
+// Data-only description of all charts. Two kinds:
+//   cloud - fixed series read from the cloud sampler
+//   perStream - one line per video stream, all showing the same metric
 const CHART_DEFS = {
   resource: {
-    state: cloudState,
+    kind: "cloud",
     canvas: "chart-resource",
+    // Each row is a line on the chart, with label, accessor, and colour
     series: [
-      { label: "Cloud CPU %", key: "cpuPercent", colorVar: "--series-1" },
-      { label: "Cloud Memory %", key: "memPercent", colorVar: "--series-2" },
-      { label: "Process CPU %", key: "procCpu", colorVar: "--series-3" },
+      { label: "Cloud CPU %", get: (r) => numOrNull(r.cpu_percent), colorVar: "--series-1" },
+      { label: "Cloud Memory %", get: (r) => numOrNull(r.mem_percent), colorVar: "--series-2" },
+      { label: "Process CPU %", get: (r) => numOrNull(r.proc_cpu), colorVar: "--series-3" },
     ],
     opts: { yMax: 100, yTitle: "%" },
   },
   edgeResource: {
-    state: edgeState,
+    kind: "edgeHost",   // host-wide, so read from whichever stream has most samples
     canvas: "chart-edge-resource",
     series: [
-      { label: "Edge CPU %", key: "edgeCpu", colorVar: "--series-1" },
-      { label: "Edge Memory %", key: "edgeMem", colorVar: "--series-2" },
+      { label: "Edge CPU %", get: (r) => numOrNull(r.edge_cpu), colorVar: "--series-1" },
+      { label: "Edge Memory %", get: (r) => numOrNull(r.edge_mem), colorVar: "--series-2" },
     ],
     opts: { yMax: 100, yTitle: "%" },
   },
-  throughput: {
-    state: edgeState,
-    canvas: "chart-throughput",
+  concurrency: {
+    kind: "cloud",
+    canvas: "chart-concurrency",
     series: [
-      { label: "Throughput", key: "throughputFps", colorVar: "--series-1" },
+      { label: "Active streams", get: (r) => numOrNull(r.active_streams), colorVar: "--series-3" },
+      { label: "Frames in flight", get: (r) => numOrNull(r.inflight_requests), colorVar: "--series-2" },
+      { label: "Load average", get: (r) => numOrNull(r.load_avg), colorVar: "--series-4" },
     ],
+    opts: { yTitle: "count" },
+  },
+  throughput: {
+    kind: "perStream",
+    canvas: "chart-throughput",
+    get: (r) => numOrNull(r.throughput_fps),
     opts: { yTitle: "frames / sec" },
   },
-  objects: {
-    state: edgeState,
-    canvas: "chart-objects",
-    series: [
-      { label: "Objects in frame", key: "objectsInFrame", colorVar: "--series-1" },
-      { label: "Unique tracked (total)", key: "uniqueTotal", colorVar: "--series-3", yAxisID: "y1" },
-    ],
-    opts: { yTitle: "objects / frame", y1Title: "unique total" },
-  },
   latency: {
-    state: edgeState,
+    kind: "perStream",
     canvas: "chart-latency",
-    series: [
-      { label: "End-to-end", key: "endToEnd", colorVar: "--series-1" },
-      { label: "Round trip", key: "roundTrip", colorVar: "--series-2" },
-      { label: "Inference", key: "inference", colorVar: "--series-3" },
-      { label: "Network", key: "network", colorVar: "--series-4" },
-    ],
+    get: (r) => numOrNull(r.end_to_end_ms),
     opts: { yTitle: "ms" },
   },
+  objects: {
+    kind: "perStream",
+    canvas: "chart-objects",
+    get: (r) => numOrNull(r.objects_in_frame),
+    opts: { yTitle: "objects / frame" },
+  },
   contentshift: {
-    state: edgeState,
+    kind: "perStream",
     canvas: "chart-contentshift",
-    series: [
-      { label: "Content-shift rate", key: "shiftRate", colorVar: "--series-1" },
-    ],
+    // computed per stream over a trailing window rather than read off a field
+    series: null,
+    derive: (recs) => rollingShiftRate(recs, CONFIG.SHIFT_RATE_WINDOW),
     opts: { yMax: 100, yTitle: "%" },
   },
   bandwidth: {
-    state: edgeState,
+    kind: "perStream",
     canvas: "chart-bandwidth",
-    series: [
-      { label: "Bandwidth", key: "bandwidthMbps", colorVar: "--series-1" },
-    ],
+    get: (r) => numOrNull(r.bandwidth_mbps),
     opts: { yTitle: "Mbps" },
   },
 };
 
+// Create all time-series charts
+// Runs once at page load as not in a function
 const charts = {};
 Object.entries(CHART_DEFS).forEach(([key, def]) => {
-  charts[key] = makeChart(def.canvas, def.series, def.opts || {});
+  charts[key] = makeChart(def.canvas, def.opts || {});
+  // fixed-series charts can build their datasets immediately; per-stream charts
+  // build theirs the first time the streams show up
+  if (def.kind !== "perStream") {
+    charts[key].data.datasets = def.series.map((s) => baseDataset(s.label, cssVar(s.colorVar), s.yAxisID));
+  }
 });
 
-function redrawCharts() {
-  Object.entries(CHART_DEFS).forEach(([key, def]) => {
-    const chart = charts[key];
-    chart.data.labels = def.state.labels;
-    chart.data.datasets.forEach((ds) => { ds.data = def.state[ds._key]; });
-    chart.update("none");
+// --- --- latency breakdown, stacked bar, one bar per stream --- ---
+// legend
+const BREAKDOWN_PARTS = [
+  { label: "Storage I/O", key: "storage_io_ms", colorVar: "--series-1" },
+  { label: "Preprocess", key: "preprocess_ms", colorVar: "--series-2" },
+  { label: "Network", key: "network_ms", colorVar: "--series-3" },
+  { label: "Cloud decode", key: "decode_ms", colorVar: "--series-4" },
+  { label: "Inference", key: "inference_ms", colorVar: "--series-5" },
+];
+
+// only bar chart so no helpers to build
+const breakdownChart = new Chart(document.getElementById("chart-breakdown").getContext("2d"), {
+  type: "bar",
+  data: {
+    labels: [],
+    datasets: BREAKDOWN_PARTS.map((p) => ({
+      label: p.label,
+      data: [],
+      backgroundColor: cssVar(p.colorVar),
+      borderWidth: 0,
+    })),
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: false,
+    scales: {
+      x: {
+        stacked: true,
+        grid: { display: false },
+        border: { color: cssVar("--axis") },
+        ticks: { color: cssVar("--text-muted") },
+      },
+      y: {
+        stacked: true,
+        beginAtZero: true,
+        grid: { color: cssVar("--gridline"), drawTicks: false },
+        border: { color: cssVar("--axis") },
+        ticks: { color: cssVar("--text-muted") },
+        title: { display: true, text: "ms", color: cssVar("--text-secondary"), font: { size: 11 } },
+      },
+    },
+    plugins: {
+      legend: { labels: { color: cssVar("--text-secondary"), boxWidth: 12, boxHeight: 12 } },
+      tooltip: {
+        backgroundColor: cssVar("--surface-1"),
+        titleColor: cssVar("--text-primary"),
+        bodyColor: cssVar("--text-secondary"),
+        borderColor: cssVar("--border"),
+        borderWidth: 1,
+        padding: 8,
+      },
+    },
+  },
+});
+
+// Check if the charts dataset matches the number of streams
+// If so, continue, else rebuild the datasets to match
+function syncStreamDatasets(chart, stream_ids) {
+  const current = chart.data.datasets.map((d) => d._stream).join("|");
+  if (current === stream_ids.join("|")) return;
+  chart.data.datasets = stream_ids.map((id, i) => {
+    const ds = baseDataset(`Stream ${id}`, streamColor(i));
+    ds._stream = id;
+    return ds;
   });
 }
 
-// ---- table-view twins (accessibility) ----
+// Refresh all charts with new data
+function redrawCharts() {
+  const liveIds = streamIds();
+
+  // Add new IDs to seen set. Return sorted ID array
+  liveIds.forEach((id) => seenStreamIds.add(id));
+  const ids = [...seenStreamIds].sort((a, b) =>
+    String(a).localeCompare(String(b), undefined, { numeric: true }));
+
+  // Update each chart (not bar chart)
+  Object.entries(CHART_DEFS).forEach(([key, def]) => {
+    const chart = charts[key];
+
+    if (def.kind === "perStream") {
+      syncStreamDatasets(chart, ids);
+      chart.data.datasets.forEach((ds) => {
+        const recs = state.streams.get(ds._stream) || []; // get each streams data
+        const values = def.derive ? def.derive(recs) : recs.map(def.get); // compute derived values (only for content shift chart) or get raw values
+        ds.data = recs.map((r, i) => ({ x: r.ts, y: values[i] })); // map to x,y points on chart
+      });
+    } else {
+       // fixed series charts - cloud and edge metrics
+      const recs = def.kind === "cloud" ? state.cloud : busiestStreamRecords(); 
+      chart.data.datasets.forEach((ds, i) => {
+        const get = def.series[i].get;
+        ds.data = recs.map((r) => ({ x: r.ts, y: get(r) })); 
+      });
+    }
+    chart.update("none");
+  });
+
+  // Update bar chart
+  breakdownChart.data.labels = ids.map((id) => `Stream ${id}`);
+  BREAKDOWN_PARTS.forEach((part, i) => {
+    breakdownChart.data.datasets[i].data = ids.map((id) => {
+      const recs = state.streams.get(id) || [];
+      return Math.round(mean(recs.map((r) => r[part.key])) * 10) / 10;
+    });
+  });
+  breakdownChart.update("none");
+}
+
+// Table view of chart data, built straight off the chart's datasets so it works
+// for both fixed-series and per-stream charts.
 function renderTable(key) {
-  const def = CHART_DEFS[key];
+  const chart = charts[key];
   const el = document.getElementById(`table-${key}`);
-  const rows = def.state.labels.map((label, i) => {
-    const cells = def.series.map((s) => {
-      const v = def.state[s.key][i];
-      return `<td>${v === null || v === undefined ? "—" : (Math.round(v * 10) / 10).toLocaleString()}</td>`;
+  if (!chart || !el) return;
+
+  // union of every x value across datasets (streams sample at different times)
+  const xs = [...new Set(chart.data.datasets.flatMap((ds) => ds.data.map((p) => p.x)))]
+    .sort((a, b) => a - b);
+  // index each dataset by x for lookup
+  const byX = chart.data.datasets.map((ds) => new Map(ds.data.map((p) => [p.x, p.y])));
+
+  const rows = xs.map((x) => {
+    // Each dataset becomes a column; blank where that series has no sample
+    const cells = byX.map((m) => {
+      const v = m.get(x);
+      return `<td>${v === null || v === undefined ? "-" : (Math.round(v * 10) / 10).toLocaleString()}</td>`;
     }).join("");
-    return `<tr><td>${label}</td>${cells}</tr>`;
+    return `<tr><td>${formatTime(x)}</td>${cells}</tr>`;
   }).reverse().join("");
-  const head = def.series.map((s) => `<th>${s.label}</th>`).join("");
+
+  const head = chart.data.datasets.map((ds) => `<th>${ds.label}</th>`).join("");
   el.innerHTML = `<table><thead><tr><th>Time</th>${head}</tr></thead><tbody>${rows}</tbody></table>`;
 }
 
+// Toggle table view for each chart, run on click
 document.querySelectorAll(".table-toggle").forEach((btn) => {
   btn.addEventListener("click", () => {
     const target = btn.dataset.target;
@@ -601,30 +759,75 @@ document.querySelectorAll(".table-toggle").forEach((btn) => {
   });
 });
 
-// ---- stat cards ----
+// --- --- stat cards --- ---
+const statStreams = document.getElementById("stat-streams");
+const statStreamsSub = document.getElementById("stat-streams-sub");
+const streamChips = document.getElementById("stream-chips");
 const statTotal = document.getElementById("stat-total");
+const statTotalSub = document.getElementById("stat-total-sub");
 const statInflight = document.getElementById("stat-inflight");
 const statRate = document.getElementById("stat-rate");
+const statRateSub = document.getElementById("stat-rate-sub");
 const statStatus = document.getElementById("stat-status");
 const statStatusSub = document.getElementById("stat-status-sub");
+const perStreamNote = document.getElementById("perstream-note");
 
 function updateStatCards() {
-  const e = latestEdge();
-  statTotal.textContent = e ? formatCompact(e.frame) : "—";
-  statInflight.textContent = e ? formatCompact(e.unique_total) : "—";
-  statRate.textContent = e && e.throughput_fps !== null && e.throughput_fps !== undefined
-    ? `${e.throughput_fps.toFixed(1)} fps`
-    : "—";
+  // Get all stream IDs, their records, and metadata
+  const ids = streamIds();
+  const latest = ids.map((id) => latestOf(state.streams.get(id)));
+  const meta = new Map(state.streamMeta.map((s) => [String(s.id), s]));
+  // filter out inactive
+  const activeIds = ids.filter((id) => meta.get(String(id))?.active !== false);
 
+  // stream count tile - give number of active streams and total seen in session 
+  statStreams.textContent = ids.length ? String(activeIds.length) : "-";
+  statStreamsSub.textContent = ids.length
+    ? (activeIds.length === ids.length
+        ? "concurrent streams in flight"
+        : `${activeIds.length} active · ${ids.length} seen this session`)
+    : "waiting for the edge client";
+
+  // Pill per stream - ID and throughput
+  streamChips.innerHTML = ids.map((id, i) => {
+    const rec = latest[i];
+    const isActive = activeIds.includes(id);
+    const fps = rec && rec.throughput_fps !== null && rec.throughput_fps !== undefined
+      ? `${rec.throughput_fps.toFixed(1)} fps` : "-";
+    return `<span class="stream-chip${isActive ? "" : " idle"}">
+              <span class="swatch" style="background:${streamColor(i)}"></span>
+              ${id} · ${fps}
+            </span>`;
+  }).join("");
+
+  perStreamNote.textContent = ids.length > 1 ? `- one line per stream (${ids.length} streams)` : "";
+
+  // --- --- Aggregate detections across streams --- ---
+  const totalFrames = latest.reduce((a, r) => a + (r?.frame || 0), 0);
+  const totalUnique = latest.reduce((a, r) => a + (r?.unique_total || 0), 0);
+  const totalFps = latest.reduce((a, r) => a + (r?.throughput_fps || 0), 0);
+
+  // Update card values
+  statTotal.textContent = ids.length ? formatCompact(totalFrames) : "-";
+  statTotalSub.textContent = ids.length > 1
+    ? `cumulative across ${ids.length} streams`
+    : "cumulative since pipeline start";
+  statInflight.textContent = ids.length ? formatCompact(totalUnique) : "-";
+  statRate.textContent = ids.length ? `${totalFps.toFixed(1)} fps` : "-";
+  statRateSub.textContent = ids.length > 1
+    ? `sum of ${ids.length} streams · ${(totalFps / ids.length).toFixed(1)} fps each`
+    : "frames/sec, reported by the edge";
+
+  // Get content shift status and update stat card
   const status = contentShiftStatus();
   statStatus.className = "value" + (status ? ` status-${status.tier}` : "");
-  statStatus.textContent = status ? status.label : "—";
+  statStatus.textContent = status ? status.label : "-";
   statStatusSub.textContent = status
-    ? `frame-diff vs. rolling baseline (last ${CONFIG.STATUS_LOOKBACK} samples)`
+    ? `frame-diff vs. rolling baseline (last ${CONFIG.STATUS_LOOKBACK} samples per stream)`
     : "waiting for enough samples";
 }
 
-// ---- connection status ----
+// --- --- Connection status --- ---
 const connIndicator = document.getElementById("conn-indicator");
 const connText = document.getElementById("conn-text");
 const connUpdated = document.getElementById("conn-updated");
@@ -633,6 +836,7 @@ const staleBanner = document.getElementById("stale-banner");
 let consecutiveFailures = 0;
 let lastSuccessAt = null;
 
+// Update connection status indicator
 function setConnectionState(kind) {
   connIndicator.className = `conn ${kind}`;
   const isStale = kind !== "live";
@@ -646,7 +850,8 @@ function setConnectionState(kind) {
   connUpdated.textContent = lastSuccessAt ? `· last update ${formatTime(lastSuccessAt)}` : "";
 }
 
-// ---- polling loop ----
+// --- --- polling loop --- ---
+// Get data. Includes a timeout.
 async function fetchMetrics() {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), CONFIG.FETCH_TIMEOUT_MS);
@@ -659,43 +864,36 @@ async function fetchMetrics() {
   }
 }
 
+
 function handleSample(data) {
   consecutiveFailures = 0;
 
-  const edgeRecs = Array.isArray(data.edge) ? data.edge : [];
+  // Pull edge, cloud, and metadata records from the response.
+  const edgeByStream = data.edge && !Array.isArray(data.edge) ? data.edge : {};
   const cloudRecs = Array.isArray(data.cloud) ? data.cloud : [];
+  state.streamMeta = Array.isArray(data.streams) ? data.streams : [];
 
-  const latestEdgeTs = edgeRecs.length ? edgeRecs[edgeRecs.length - 1].ts : null;
-  const latestCloudTs = cloudRecs.length ? cloudRecs[cloudRecs.length - 1].ts : null;
-  lastSuccessAt = Math.max(latestEdgeTs || 0, latestCloudTs || 0) || Date.now() / 1000;
-  setConnectionState("live");
-
-  fillSeries(cloudState, cloudRecs, CONFIG.WINDOW_SIZE, {
-    cpuPercent: (r) => numOrNull(r.cpu_percent),
-    memPercent: (r) => numOrNull(r.mem_percent),
-    procCpu: (r) => numOrNull(r.proc_cpu),
+  // Server returns full history, trim to window size
+  // Clear and rebuild the state
+  state.cloud = cloudRecs.slice(-CONFIG.WINDOW_SIZE);
+  state.streams.clear();
+  Object.entries(edgeByStream).forEach(([id, recs]) => {
+    state.streams.set(id, (recs || []).slice(-CONFIG.WINDOW_SIZE));
   });
 
-  // per-core CPU boxes — driven by the latest cloud sample's cpu_per_core list
-  const latestCloud = cloudRecs.length ? cloudRecs[cloudRecs.length - 1] : null;
+  // Dashboard includes a last updated timestamp - shows if connection is active or stale.
+  const latestEdgeTs = Math.max(0, ...[...state.streams.values()].map((r) => latestOf(r)?.ts || 0));
+  const latestCloudTs = latestOf(state.cloud)?.ts || 0;
+  lastSuccessAt = Math.max(latestEdgeTs, latestCloudTs) || Date.now() / 1000;
+  setConnectionState("live");
+
+  // Update per-core usage visual
+  const latestCloud = latestOf(state.cloud);
   if (latestCloud && Array.isArray(latestCloud.cpu_per_core)) {
     renderPerCore(latestCloud.cpu_per_core);
   }
 
-  fillSeries(edgeState, edgeRecs, CONFIG.WINDOW_SIZE, {
-    edgeCpu: (r) => numOrNull(r.edge_cpu),
-    edgeMem: (r) => numOrNull(r.edge_mem),
-    throughputFps: (r) => numOrNull(r.throughput_fps),
-    objectsInFrame: (r) => numOrNull(r.objects_in_frame),
-    uniqueTotal: (r) => numOrNull(r.unique_total),
-    endToEnd: (r) => numOrNull(r.end_to_end_ms),
-    roundTrip: (r) => numOrNull(r.round_trip_ms),
-    inference: (r) => numOrNull(r.inference_ms),
-    network: (r) => numOrNull(r.network_ms),
-    bandwidthMbps: (r) => numOrNull(r.bandwidth_mbps),
-  });
-  edgeState.shiftRate = rollingShiftRate(edgeState.raw, CONFIG.SHIFT_RATE_WINDOW);
-
+  // Update all stat cards, charts and tables with the new data
   updateStatCards();
   redrawCharts();
   document.querySelectorAll(".data-table.open").forEach((el) => {
@@ -706,10 +904,10 @@ function handleSample(data) {
 function handleFailure() {
   consecutiveFailures += 1;
   setConnectionState(consecutiveFailures > 0 && lastSuccessAt ? "reconnecting" : "connecting");
-  // the server is the source of truth for history, so on a failed poll we
-  // simply stop refreshing — charts/stat cards freeze on last-known values
 }
 
+
+// Fetch metrics, update visuals, schedule next fetch. If the fetch fails, update connection status.
 async function pollLoop() {
   try {
     const data = await fetchMetrics();
@@ -720,12 +918,6 @@ async function pollLoop() {
     setTimeout(pollLoop, CONFIG.POLL_INTERVAL_MS);
   }
 }
-
-// simplest correct way to re-resolve every chart color against the new
-// CSS variables if the OS theme flips while the page is open
-window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
-  location.reload();
-});
 
 pollLoop();
 </script>
