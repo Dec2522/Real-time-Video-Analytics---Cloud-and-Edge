@@ -83,6 +83,9 @@ def load_model(weights, backend, size, int8=False, data=None):
     if not os.path.exists(target):
         print(f"[server] exporting {weights} -> {backend} (imgsz={size}, int8={int8}); first run only")
         kwargs = {"format": backend, "imgsz": size}
+        if backend == "onnx":
+            # Runtime rejected the default newer version of opset, so have forced an older one.
+            kwargs["opset"] = 20
         if backend == "openvino" and int8:
             # INT8 needs a calibration set; ultralytics falls back to a small
             # default COCO subset (downloaded on demand) when data is omitted.
