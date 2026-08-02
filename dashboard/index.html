@@ -227,7 +227,7 @@
     <div class="chart-grid cols-2">
       <div class="chart-card">
         <div class="card-head">
-          <h3>Throughput</h3>
+          <h3>Processing rate <span class="note" id="fps-target-note"></span></h3>
           <button class="table-toggle" data-target="throughput">View as table</button>
         </div>
         <div class="canvas-wrap"><canvas id="chart-throughput"></canvas></div>
@@ -293,6 +293,7 @@ const CONFIG = {
   WINDOW_SIZE: 90,           // rolling samples kept on screen per chart (per stream)
   FETCH_TIMEOUT_MS: 3000,
   SHIFT_RATE_WINDOW: 10,     // trailing edge samples used for the content-shift rolling rate
+  FPS_WINDOW: 5,             // trailing edge samples used for the achieved-fps rolling rate
   STATUS_LOOKBACK: 5,        // trailing edge samples used for the content-shift status badge
 };
 // ============================================================
@@ -363,6 +364,30 @@ function rollingShiftRate(records, window) {
     const flagged = slice.filter((r) => r.content_shift_detected).length;
     return (flagged / slice.length) * 100;
   });
+}
+
+// Achieved frame rate over a trailing window: frames advanced / wall seconds.
+// The edge's own throughput_fps is cumulative since stream start, so it barely
+// moves once a run is underway. Under real-time pacing this sits at the source
+// fps, and dips below it exactly when the edge can't service the feed in time.
+function rollingFps(records, window) {
+  return records.map((r, i) => {
+    const start = Math.max(0, i - window + 1);
+    if (start === i) return numOrNull(r.throughput_fps);  // first sample: nothing to diff against
+    const dt = records[i].ts - records[start].ts;
+    const df = records[i].frame - records[start].frame;
+    return dt > 0 ? df / dt : null;
+  });
+}
+
+// The fps the edge is pacing to, from the most recent record that reports one.
+// null when every stream is running unpaced.
+function pacingTarget() {
+  for (const recs of state.streams.values()) {
+    const t = numOrNull(latestOf(recs)?.target_fps);
+    if (t) return t;
+  }
+  return null;
 }
 
 // Get latest record from an array
@@ -568,7 +593,9 @@ const CHART_DEFS = {
   throughput: {
     kind: "perStream",
     canvas: "chart-throughput",
-    get: (r) => numOrNull(r.throughput_fps),
+    // rolling achieved rate, not the edge's cumulative average - see rollingFps
+    series: null,
+    derive: (recs) => rollingFps(recs, CONFIG.FPS_WINDOW),
     opts: { yTitle: "frames / sec" },
   },
   latency: {
@@ -771,6 +798,14 @@ const statRateSub = document.getElementById("stat-rate-sub");
 const statStatus = document.getElementById("stat-status");
 const statStatusSub = document.getElementById("stat-status-sub");
 const perStreamNote = document.getElementById("perstream-note");
+const fpsTargetNote = document.getElementById("fps-target-note");
+
+// Most recent achieved rate for one stream, same basis as the chart
+function currentFps(records) {
+  if (!records || !records.length) return null;
+  const values = rollingFps(records, CONFIG.FPS_WINDOW);
+  return values[values.length - 1];
+}
 
 function updateStatCards() {
   // Get all stream IDs, their records, and metadata
@@ -788,12 +823,12 @@ function updateStatCards() {
         : `${activeIds.length} active · ${ids.length} seen this session`)
     : "waiting for the edge client";
 
-  // Pill per stream - ID and throughput
+  // Pill per stream - ID and current processing rate
   streamChips.innerHTML = ids.map((id, i) => {
-    const rec = latest[i];
     const isActive = activeIds.includes(id);
-    const fps = rec && rec.throughput_fps !== null && rec.throughput_fps !== undefined
-      ? `${rec.throughput_fps.toFixed(1)} fps` : "-";
+    const streamFps = currentFps(state.streams.get(id));
+    const fps = streamFps === null || streamFps === undefined
+      ? "-" : `${streamFps.toFixed(1)} fps`;
     return `<span class="stream-chip${isActive ? "" : " idle"}">
               <span class="swatch" style="background:${streamColor(i)}"></span>
               ${id} · ${fps}
@@ -805,7 +840,13 @@ function updateStatCards() {
   // --- --- Aggregate detections across streams --- ---
   const totalFrames = latest.reduce((a, r) => a + (r?.frame || 0), 0);
   const totalUnique = latest.reduce((a, r) => a + (r?.unique_total || 0), 0);
-  const totalFps = latest.reduce((a, r) => a + (r?.throughput_fps || 0), 0);
+  const totalFps = ids.reduce((a, id) => a + (currentFps(state.streams.get(id)) || 0), 0);
+
+  // Pacing target - shown next to the processing-rate chart and on the rate tile
+  const target = pacingTarget();
+  fpsTargetNote.textContent = target
+    ? `paced to ${target.toFixed(target % 1 ? 2 : 0)} fps`
+    : (ids.length ? "unpaced - max decode speed" : "");
 
   // Update card values
   statTotal.textContent = ids.length ? formatCompact(totalFrames) : "-";
@@ -814,9 +855,13 @@ function updateStatCards() {
     : "cumulative since pipeline start";
   statInflight.textContent = ids.length ? formatCompact(totalUnique) : "-";
   statRate.textContent = ids.length ? `${totalFps.toFixed(1)} fps` : "-";
-  statRateSub.textContent = ids.length > 1
-    ? `sum of ${ids.length} streams · ${(totalFps / ids.length).toFixed(1)} fps each`
-    : "frames/sec, reported by the edge";
+  // Against the per-stream target, so "keeping up" is readable at a glance
+  const perStream = ids.length ? totalFps / ids.length : 0;
+  statRateSub.textContent = !ids.length
+    ? "frames/sec, all streams combined"
+    : target
+      ? `${perStream.toFixed(1)} fps per stream vs ${target.toFixed(target % 1 ? 2 : 0)} fps target`
+      : `sum of ${ids.length} stream(s) · ${perStream.toFixed(1)} fps each`;
 
   // Get content shift status and update stat card
   const status = contentShiftStatus();

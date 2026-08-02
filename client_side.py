@@ -18,6 +18,9 @@ DIFF_K = 3.0             # how many standard deviations away from mean single a 
 
 PUSH_EVERY = 15          # metric push cadence
 
+# Real-time pacing: a file decodes as fast as the CPU allows, so set a sleep to pace to the videos fps.
+FALLBACK_FPS = 30.0      # used when the container reports no usable fps
+
 # For comparison of methods - `none` infer on every frame, `fixed` infer every N frames, and `adaptive` on content-shift changes
 GATE_MODES = ("none", "fixed", "adaptive")
 DEFAULT_FRAME_GAP = 5    
@@ -29,6 +32,9 @@ CSV_HEADER = [
     "throughput_fps", "objects_in_frame", "unique_total",
     "edge_cpu", "edge_mem", "payload_kb", "bandwidth_mbps",
     "frame_diff", "content_shift_detected", "ttff_ms",
+    # how far behind the frame's scheduled arrival time we finished it - the
+    # real "can the edge keep up?" signal once the loop is paced
+    "pacing_lag_ms",
     # --- frame gating ---
     "gate_mode", "inference_ran", "filter_rate",
     # cloud runtime that served this run, so backend comparisons are self-labelling
@@ -54,9 +60,10 @@ def rnd(value, digits):
     return None if value is None else round(value, digits)
 
 
-def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_FRAME_GAP):
+def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_FRAME_GAP,
+               realtime=True):
     """Process a single video stream, sending frames to the cloud for inference, and logging metrics."""
-  
+
     detect_url = f"{host}/detect"
     metrics_url = f"{host}/metrics"
 
@@ -64,6 +71,17 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
     if not cap.isOpened():
         print(f"[stream {stream_id}] ERROR: could not open {video_path}")
         return
+
+    # Pace to the video's own fps, so the loop behaves like a camera feed
+    # instead of racing through the file at decode speed.
+    src_fps = cap.get(cv2.CAP_PROP_FPS)
+    if not (src_fps and src_fps > 0):   # also catches the NaN some containers report
+        src_fps = FALLBACK_FPS
+        if realtime:
+            with print_lock:
+                print(f"[stream {stream_id}] no fps in container, pacing at {FALLBACK_FPS:g} fps")
+    # 0 disables pacing - the loop then runs at whatever speed decode allows
+    frame_interval = (1.0 / src_fps) if realtime else 0.0
 
     # one connection pool per stream, so streams don't queue behind each other
     session = requests.Session()
@@ -80,6 +98,8 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
     last_dets = None
     frames_inferred = 0
     frames_skipped = 0
+    frames_late = 0            # frames that finished after their scheduled slot
+    max_lag_ms = 0.0
     backend = None            # reported by the cloud on each /detect response
 
     csv_file = open(f"edge_metrics_stream{stream_id}.csv", "w", newline="")
@@ -183,6 +203,17 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
         # frames completed per second so far
         throughput_fps = frame_num / (time.time() - wall_start)
 
+        # How late this frame is against its slot in the stream's schedule.
+        # Frame N is due at wall_start + (N-1) * frame_interval; a lag that
+        # climbs means the edge can't service the feed in real time.
+        if frame_interval:
+            pacing_lag_ms = (time.time() - wall_start - (frame_num - 1) * frame_interval) * 1000
+            if pacing_lag_ms > frame_interval * 1000:
+                frames_late += 1
+            max_lag_ms = max(max_lag_ms, pacing_lag_ms)
+        else:
+            pacing_lag_ms = None   # unpaced: there's no schedule to be late against
+
         # Count labels
         labels = [d["label"] for d in dets]
         object_counts = {l: labels.count(l) for l in set(labels)}
@@ -195,7 +226,6 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
         # --- assemble the metrics record ---
         # Assembled for EVERY decoded frame, gated or not, so the push cadence
         # below is unaffected by the gate mode. rnd() keeps the null-on-reuse
-        # latency fields as real nulls instead of crashing on round(None).
         record = {
             "stream_id": stream_id,
             "video": video_path,
@@ -219,6 +249,10 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
             "frame_diff": rnd(frame_diff, 2),
             "content_shift_detected": content_shift_detected,
             "ttff_ms": round(ttff_ms, 1) if frame_num == 1 else None,
+            "pacing_lag_ms": rnd(pacing_lag_ms, 1),
+            # fps the loop is pacing to, so the dashboard can show achieved
+            # rate against the target instead of a bare throughput number
+            "target_fps": round(src_fps, 2) if frame_interval else None,
             # frame gating
             "gate_mode": gate_mode,
             "inference_ran": run_inference,
@@ -244,12 +278,23 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
             except requests.RequestException:
                 pass
 
+        # If frame processing finishes early, wait for the next frames slot rather than racing ahead infront of real time.
+        # Sleeping against an absolute deadline (rather than a fixed sleep per
+        # frame) means processing time is absorbed by the wait instead of
+        # accumulating as drift.
+        if frame_interval:
+            next_due = wall_start + frame_num * frame_interval
+            wait = next_due - time.time()
+            if wait > 0:
+                time.sleep(wait)
+
     cap.release()
     csv_file.close()
 
     with print_lock:
-        rate = frames_skipped / frame_num if frame_num else 0
-        print(f"stream {stream_id} COMPLETE: gate={gate_mode} "
+        pacing_desc = (f"paced={src_fps:.3g}fps late={frames_late} max_lag={max_lag_ms:.0f}ms "
+                       if frame_interval else "unpaced ")
+        print(f"stream {stream_id} COMPLETE: gate={gate_mode} {pacing_desc}"
               f"frames={frame_num} inferred={frames_inferred} skipped={frames_skipped} "
               f"Unique Objects={len(seen_ids)}, Total time={time.time() - wall_start:.1f}s")
 
@@ -264,8 +309,12 @@ def main():
     parser.add_argument("--host", default=CLOUD_HOST, help="cloud base URL")
     parser.add_argument("--gate", choices=GATE_MODES, default="none",
                         help="frame gating mode: none = infer on every frame "
-                             "(baseline), fixed = every --frame-gap'th frame, "
+                             "(baseline), fixed = every --frame-gap'th frame, " #####edit this desciptio
                              "adaptive = only on content-shift frames")
+    parser.add_argument("--no-realtime", dest="realtime", action="store_false",
+                        help="decode as fast as the machine allows instead of pacing to "
+                             "the video's fps - measures raw pipeline capacity rather "
+                             "than live-stream latency")
     parser.add_argument("--frame-gap", type=int, default=DEFAULT_FRAME_GAP,
                         help=f"'fixed' gate only: run inference every Nth frame "
                              f"(default {DEFAULT_FRAME_GAP})")
@@ -280,11 +329,13 @@ def main():
     threading.Thread(target=sample_host_usage, daemon=True).start()
 
     gate_desc = args.gate + (f" (every {args.frame_gap} frames)" if args.gate == "fixed" else "")
-    print(f"Starting {count} concurrent stream(s) -> {args.host} | gate: {gate_desc}")
+    pace_desc = "real-time (source fps)" if args.realtime else "unpaced (max decode speed)"
+    print(f"Starting {count} concurrent stream(s) -> {args.host} | gate: {gate_desc} | pacing: {pace_desc}")
     threads = []
     for stream_id, video_path in enumerate(sources):
         t = threading.Thread(target=run_stream,
-                             args=(stream_id, video_path, args.host, args.gate, args.frame_gap),
+                             args=(stream_id, video_path, args.host, args.gate, args.frame_gap,
+                                   args.realtime),
                              name=f"stream-{stream_id}", daemon=True)
         t.start()
         threads.append(t)
