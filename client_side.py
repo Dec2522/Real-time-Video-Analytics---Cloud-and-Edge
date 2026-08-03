@@ -145,8 +145,8 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
         if run_inference:
             # Edge preprocessing - resize and encode, image already in gray scale
             prep0 = time.time()
-            small = cv2.resize(frame, (960, 540))
-            ok, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 80])  # set image quality
+            small = cv2.resize(frame, (640, 360))
+            ok, buf = cv2.imencode(".png", frame) #cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 80])  # set image quality, for golden ratio test use cv2.imencode(".png", frame) - pass raw image
             preprocess_ms = (time.time() - prep0) * 1000  # preprocessing duration
             payload_kb = len(buf) / 1024  # size of compressed image
 

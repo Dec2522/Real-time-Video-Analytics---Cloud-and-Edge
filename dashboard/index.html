@@ -16,14 +16,14 @@
     --gridline:       #e1e0d9;
     --axis:           #c3c2b7;
     --border:         rgba(11,11,11,0.10);
-    --series-1: #2a78d6; /* blue   */
-    --series-2: #eb6834; /* orange */
-    --series-3: #1baf7a; /* aqua   */
+    --series-1: #0A407A; /* blue   */
+    --series-2: #DB7925; /* orange */
+    --series-3: #1ea174; /* aqua   */
     --series-4: #eda100; /* yellow */
     --series-5: #8a63d2; /* purple */
-    --status-good:     #0ca30c;
-    --status-warning:  #fab219;
-    --status-critical: #d03b3b;
+    --status-good:     #047504;
+    --status-warning:  #e9a81b;
+    --status-critical: #ce1b1b;
   }
 
   * { box-sizing: border-box; }
@@ -54,7 +54,7 @@
   section > h2 {
     font-size: 13px;
     font-weight: 600;
-    text-transform: uppercase;
+    text-transform: capitalize;
     letter-spacing: 0.04em;
     color: var(--text-muted);
     margin: 0 0 10px;
@@ -214,7 +214,7 @@
       </div>
       <div class="chart-card">
         <div class="card-head">
-          <h3>Per-core CPU</h3>
+          <h3>Per-core Cloud CPU</h3>
           <span class="note" id="percore-note"></span>
         </div>
         <div id="percore-grid"></div>
@@ -412,7 +412,7 @@ function contentShiftStatus() {
   }
   if (!recent.length) return null;
   const flagged = recent.filter((r) => r.content_shift_detected).length;
-  if (flagged === 0) return { tier: "good", label: "✓ Stable" };
+  if (flagged === 0) return { tier: "good", label: "Stable" };
   if (flagged <= Math.max(1, state.streams.size)) return { tier: "warning", label: "~ Shift detected" };
   return { tier: "critical", label: "! Frequent shifts" };
 }

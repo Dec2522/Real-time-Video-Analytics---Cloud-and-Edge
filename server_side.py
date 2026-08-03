@@ -1,4 +1,5 @@
 import argparse
+import csv
 import os
 
 from flask import Flask, request, jsonify
@@ -15,6 +16,20 @@ app = Flask(__name__)
 MODEL_WEIGHTS = "yolo11n.pt"
 HISTORY_LEN = 300          # samples retained per series for the dashboard
 STREAM_TIMEOUT_S = 15      # no traffic for this long => stream counted as finished
+
+CSV_DIR = "results"        # cloud metrics CSVs land here, one per run
+
+# Cloud metrics CSV layout. The per-core columns sit between these two blocks and
+# are generated at open time, since the core count isn't known until runtime.
+# The run's config is repeated on every row so a CSV can be analysed on its own
+# without needing the filename parsed - matches how the edge CSV carries `backend`.
+CLOUD_CSV_PREFIX = ["ts", "elapsed_s", "cpu_percent"]
+CLOUD_CSV_SUFFIX = [
+    "mem_percent", "mem_used_mb", "net_sent_mb", "net_recv_mb",
+    "proc_cpu", "proc_mem_mb", "load_avg",
+    "inflight_requests", "active_streams",
+    "backend", "weights", "imgsz", "int8", "threads",
+]
 
 # Inference backends. `pytorch` is the unoptimised baseline, the other two are
 # the CPU optimisation, kept switchable so they can be compared
@@ -50,9 +65,7 @@ model = None                      # assigned in main() once the backend is known
 model_lock = threading.Lock()
 stream_trackers = {}              # stream_id - saved predictor.trackers list
 
-# Inference resolution. Passed explicitly on every call so that the exported
-# backends (which bake in a fixed input shape) and the pytorch baseline are
-# compared at exactly the same resolution.
+# Inference resolution
 imgsz = DEFAULT_IMGSZ
 
 # Describes the active backend, surfaced to the dashboard so a run can be
@@ -131,29 +144,76 @@ def active_streams(now=None):
             if now - info["last_seen"] <= STREAM_TIMEOUT_S]
 
 
+def run_tag(args):
+    """Filename stem describing this run's config, so runs don't overwrite each other."""
+    stem = os.path.splitext(os.path.basename(args.weights))[0]
+    parts = [time.strftime("%Y%m%d-%H%M%S"), args.backend, stem, f"imgsz{args.imgsz}"]
+    if args.int8:
+        parts.append("int8")
+    if args.threads:
+        parts.append(f"t{args.threads}")
+    return "_".join(parts)
+
+
 # --- background thread: sample cloud resources once a second ---
-def sample_cloud_metrics():
+def sample_cloud_metrics(csv_path=None):
     proc = psutil.Process() # the current process
+
+    header = writer = csv_file = None
+    if csv_path:
+        # One column per logical core. Sampled once up front to fix the width -
+        # the header has to be written before the first row.
+        n_cores = len(psutil.cpu_percent(percpu=True))
+        header = (CLOUD_CSV_PREFIX + [f"cpu_core{i}" for i in range(n_cores)]
+                  + CLOUD_CSV_SUFFIX)
+        csv_file = open(csv_path, "w", newline="")
+        writer = csv.writer(csv_file)
+        writer.writerow(header)
+        csv_file.flush()
+        print(f"[server] cloud metrics -> {csv_path}")
+
+    t_start = time.time()
     while True:
+        # Sampled outside the lock: these are syscalls, and /detect contends for
+        # the same lock on every frame.
+        now = time.time()
+        record = {
+            "ts": now,
+            "cpu_percent": psutil.cpu_percent(),
+            "cpu_per_core": psutil.cpu_percent(percpu=True),
+            "mem_percent": psutil.virtual_memory().percent,
+            "mem_used_mb": round(psutil.virtual_memory().used / 1e6, 1),
+            "net_sent_mb": round(psutil.net_io_counters().bytes_sent / 1e6, 1),
+            "net_recv_mb": round(psutil.net_io_counters().bytes_recv / 1e6, 1),
+            # Process i.e. the codes cost
+            "proc_cpu": proc.cpu_percent(), # Sums across cores
+            "proc_mem_mb": round(proc.memory_info().rss / 1e6, 1),
+            # Queue - the avg number of processes wanting CPU
+            "load_avg": psutil.getloadavg()[0],
+            # Concurrency
+            "inflight_requests": inflight,
+        }
         with lock:
+            record["active_streams"] = len(active_streams(now))
             # add cloud metrics
-            cloud_metrics_history.append({
-                "ts": time.time(),
-                "cpu_percent": psutil.cpu_percent(),
-                "cpu_per_core": psutil.cpu_percent(percpu=True),
-                "mem_percent": psutil.virtual_memory().percent,
-                "mem_used_mb": round(psutil.virtual_memory().used / 1e6, 1), 
-                "net_sent_mb": round(psutil.net_io_counters().bytes_sent / 1e6, 1), 
-                "net_recv_mb": round(psutil.net_io_counters().bytes_recv / 1e6, 1),
-                # Process i.e. the codes cost
-                "proc_cpu": proc.cpu_percent(), # Sums across cores
-                "proc_mem_mb": round(proc.memory_info().rss / 1e6, 1),
-                # Queue - the avg number of processes wanting CPU
-                "load_avg": psutil.getloadavg()[0],
-                # Concurrency
-                "inflight_requests": inflight,
-                "active_streams": len(active_streams()),
-            })
+            cloud_metrics_history.append(record)
+
+        if writer:
+            # Flat view of the record for CSV: per-core list spread across columns,
+            # run config appended. `ts` is absolute wall clock on both sides, so
+            # cloud and edge CSVs join on it directly.
+            flat = dict(record, elapsed_s=round(now - t_start, 1),
+                        weights=runtime_info["weights"],
+                        backend=runtime_info["backend"],
+                        imgsz=runtime_info["imgsz"],
+                        int8=runtime_info["int8"],
+                        threads=runtime_info["torch_threads"])
+            flat.update({f"cpu_core{i}": v for i, v in enumerate(record["cpu_per_core"])})
+            writer.writerow([flat.get(c) for c in header])
+            # Flushed every row - this thread is a daemon, so Ctrl-C kills the
+            # process without unwinding and anything still buffered is lost.
+            csv_file.flush()
+
         time.sleep(1) # sample metrics every second
 
 # Video detection end point
@@ -165,7 +225,7 @@ def detect():
     t0 = time.time()
     jpg_bytes = request.data # Get data
     arr = np.frombuffer(jpg_bytes, dtype=np.uint8) # convert to numpy array
-    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR) # decode into coloured image
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR) # stays gray scale
     decode_ms = (time.time() - t0) * 1000 # log decode latency
 
     with inflight_lock:
@@ -280,6 +340,10 @@ def main():
                         help="cap the runtime's CPU threads; pin this when comparing "
                              "backends or sweeping stream counts")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--csv", default=None,
+                        help=f"cloud metrics CSV path (default: auto-named under {CSV_DIR}/)")
+    parser.add_argument("--no-csv", dest="write_csv", action="store_false",
+                        help="don't log cloud metrics to disk (dashboard still works)")
     args = parser.parse_args()
 
     if args.int8 and args.backend != "openvino":
@@ -307,7 +371,14 @@ def main():
                 imgsz=args.imgsz, verbose=False)
     stream_trackers.clear()
 
-    threading.Thread(target=sample_cloud_metrics, daemon=True).start()
+    csv_path = None
+    if args.write_csv:
+        csv_path = args.csv or os.path.join(CSV_DIR, f"cloud_{run_tag(args)}.csv")
+        parent = os.path.dirname(csv_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+    threading.Thread(target=sample_cloud_metrics, args=(csv_path,), daemon=True).start()
 
     print(f"[server] backend={args.backend} weights={args.weights} "
           f"imgsz={args.imgsz} int8={args.int8} threads={args.threads or 'auto'}")
