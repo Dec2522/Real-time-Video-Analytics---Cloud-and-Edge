@@ -23,7 +23,7 @@ FALLBACK_FPS = 30.0      # used when the container reports no usable fps
 
 # For comparison of methods - `none` infer on every frame, `fixed` infer every N frames, and `adaptive` on content-shift changes
 GATE_MODES = ("none", "fixed", "adaptive")
-DEFAULT_FRAME_GAP = 5    
+DEFAULT_FRAME_GAP = 5
 
 # Save results for post-run analysis
 CSV_HEADER = [
@@ -145,8 +145,11 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
         if run_inference:
             # Edge preprocessing - resize and encode, image already in gray scale
             prep0 = time.time()
-            small = cv2.resize(frame, (640, 360))
-            ok, buf = cv2.imencode(".png", frame) #cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 80])  # set image quality, for golden ratio test use cv2.imencode(".png", frame) - pass raw image
+            # --- baseline: downscale + lossy JPEG. Comment back in after the golden run ---
+            # small = cv2.resize(frame, (640, 360))
+            # ok, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 80])  # set image quality
+            # --- golden run: native resolution, lossless PNG, no resize ---
+            ok, buf = cv2.imencode(".png", frame)
             preprocess_ms = (time.time() - prep0) * 1000  # preprocessing duration
             payload_kb = len(buf) / 1024  # size of compressed image
 
