@@ -25,6 +25,12 @@ FALLBACK_FPS = 30.0      # used when the container reports no usable fps
 GATE_MODES = ("none", "fixed", "adaptive")
 DEFAULT_FRAME_GAP = 5
 
+# Wire format for frames sent to the cloud. `png` is lossless - the golden run's
+# upper bound on both accuracy and payload. `jpeg` is the lossy baseline, swept
+# across --width to trade bandwidth against detection quality.
+ENCODINGS = ("png", "jpeg")
+DEFAULT_JPEG_QUALITY = 80
+
 # Save results for post-run analysis
 CSV_HEADER = [
     "stream_id", "frame", "ts", "storage_io_ms", "preprocess_ms", "round_trip_ms",
@@ -61,7 +67,7 @@ def rnd(value, digits):
 
 
 def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_FRAME_GAP,
-               realtime=True):
+               realtime=True, encoding="png", width=None, jpeg_quality=DEFAULT_JPEG_QUALITY):
     """Process a single video stream, sending frames to the cloud for inference, and logging metrics."""
 
     detect_url = f"{host}/detect"
@@ -82,6 +88,20 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
                 print(f"[stream {stream_id}] no fps in container, pacing at {FALLBACK_FPS:g} fps")
     # 0 disables pacing - the loop then runs at whatever speed decode allows
     frame_interval = (1.0 / src_fps) if realtime else 0.0
+
+    # Resolve --width against the source once, so the resize target is fixed for
+    # the run. Height follows the source aspect ratio, and a --width at or above
+    # the native width is treated as "send native" - upscaling on the edge would
+    # cost bandwidth without adding detail.
+    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    resize_to = None
+    if width and src_w and src_h and width < src_w:
+        resize_to = (width, round(src_h * width / src_w))
+    encode_desc = f"{encoding}" + (f"q{jpeg_quality}" if encoding == "jpeg" else "")
+    res_desc = f"{resize_to[0]}x{resize_to[1]}" if resize_to else f"native {src_w}x{src_h}"
+    with print_lock:
+        print(f"[stream {stream_id}] encoding {encode_desc} at {res_desc}")
 
     # one connection pool per stream, so streams don't queue behind each other
     session = requests.Session()
@@ -145,11 +165,14 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
         if run_inference:
             # Edge preprocessing - resize and encode, image already in gray scale
             prep0 = time.time()
-            # --- baseline: downscale + lossy JPEG. Comment back in after the golden run ---
-            # small = cv2.resize(frame, (640, 360))
-            # ok, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 80])  # set image quality
-            # --- golden run: native resolution, lossless PNG, no resize ---
-            ok, buf = cv2.imencode(".png", frame)
+            # Downscale first when asked, so the encoder only works on the pixels
+            # that go on the wire.
+            to_encode = cv2.resize(frame, resize_to) if resize_to else frame
+            if encoding == "jpeg":
+                ok, buf = cv2.imencode(".jpg", to_encode,
+                                       [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+            else:
+                ok, buf = cv2.imencode(".png", to_encode)   # lossless, no quality knob
             preprocess_ms = (time.time() - prep0) * 1000  # preprocessing duration
             payload_kb = len(buf) / 1024  # size of compressed image
 
@@ -321,10 +344,26 @@ def main():
     parser.add_argument("--frame-gap", type=int, default=DEFAULT_FRAME_GAP,
                         help=f"'fixed' gate only: run inference every Nth frame "
                              f"(default {DEFAULT_FRAME_GAP})")
+    parser.add_argument("--encode", choices=ENCODINGS, default="png",
+                        help="wire format: png = lossless golden run, "
+                             "jpeg = lossy baseline")
+    parser.add_argument("--width", type=int, default=None,
+                        help="downscale to this width before encoding, keeping the "
+                             "source aspect ratio (e.g. 1920 / 1280 / 640). Omit, or "
+                             "pass the native width, to send at full resolution. Match "
+                             "this to the cloud's --imgsz for a like-for-like sweep")
+    parser.add_argument("--jpeg-quality", type=int, default=DEFAULT_JPEG_QUALITY,
+                        help=f"jpeg only: encoder quality 1-100 (default {DEFAULT_JPEG_QUALITY})")
     args = parser.parse_args()
 
     if args.frame_gap < 1:
         parser.error("--frame-gap must be >= 1")
+
+    if args.width is not None and args.width < 1:
+        parser.error("--width must be >= 1")
+
+    if not 1 <= args.jpeg_quality <= 100:
+        parser.error("--jpeg-quality must be between 1 and 100")
 
     count = args.streams or len(args.videos)
     sources = [args.videos[i % len(args.videos)] for i in range(count)]
@@ -338,7 +377,7 @@ def main():
     for stream_id, video_path in enumerate(sources):
         t = threading.Thread(target=run_stream,
                              args=(stream_id, video_path, args.host, args.gate, args.frame_gap,
-                                   args.realtime),
+                                   args.realtime, args.encode, args.width, args.jpeg_quality),
                              name=f"stream-{stream_id}", daemon=True)
         t.start()
         threads.append(t)
