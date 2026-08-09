@@ -231,9 +231,10 @@ def detect():
     with inflight_lock:
         inflight += 1
     try:
-        t1 = time.time()
+        t_wait = time.time()
         # One model, one lock: streams queue here rather than inferring in parallel.
         with model_lock:
+            t_infer = time.time()
             predictor = _swap_in_trackers(stream_id)
             # run YOLO with track for persistent object IDs across frames
             results = model.track(frame, persist=True, conf=0.3, verbose=False,
@@ -241,7 +242,9 @@ def detect():
                                   classes=[2, 3, 5, 7]) # Classes = vehicles we want to detect
             # predictor only exists after the first call - re-fetch on frame 1
             _swap_out_trackers(stream_id, predictor or getattr(model, "predictor", None))
-        inference_ms = (time.time() - t1) * 1000 # log inference latency
+            inference_ms = (time.time() - t_infer) * 1000 # log inference latency
+        # time spent queued behind other streams, kept separate from compute
+        queue_wait_ms = (t_infer - t_wait) * 1000
     finally:
         with inflight_lock:
             inflight -= 1
@@ -274,6 +277,7 @@ def detect():
         "counts": counts,                          # per-label counts for THIS frame
         "decode_ms": round(decode_ms, 1),          # cloud-side JPEG decode time
         "inference_ms": round(inference_ms, 1),    # cloud-side compute time for THIS frame
+        "queue_wait_ms": round(queue_wait_ms, 1),  # time queued for model_lock behind other streams
         "backend": runtime_info["backend"],        # so the edge CSV records which runtime served it
     })
 

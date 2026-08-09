@@ -34,7 +34,7 @@ DEFAULT_JPEG_QUALITY = 80
 # Save results for post-run analysis
 CSV_HEADER = [
     "stream_id", "frame", "ts", "storage_io_ms", "preprocess_ms", "round_trip_ms",
-    "decode_ms", "inference_ms", "network_ms", "end_to_end_ms",
+    "decode_ms", "inference_ms", "queue_wait_ms", "network_ms", "end_to_end_ms",
     "throughput_fps", "objects_in_frame", "unique_total",
     "edge_cpu", "edge_mem", "payload_kb", "bandwidth_mbps",
     "frame_diff", "content_shift_detected", "ttff_ms",
@@ -190,6 +190,7 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
                 dets = data["detections"]
                 decode_ms = data.get("decode_ms", 0)
                 inference_ms = data.get("inference_ms", 0)
+                queue_wait_ms = data.get("queue_wait_ms", 0)
                 backend = data.get("backend")
             except requests.RequestException as e:
                 with print_lock:
@@ -199,8 +200,8 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
             last_dets = dets
             frames_inferred += 1
 
-            # network time = round trip minus cloud-side decode + inference
-            network_ms = round_trip_ms - decode_ms - inference_ms
+            # network time = round trip minus cloud-side decode + inference + lock wait
+            network_ms = round_trip_ms - decode_ms - inference_ms - queue_wait_ms
 
             # end-to-end latency: disk read, encode, cloud response
             end_to_end_ms = storage_io_ms + preprocess_ms + round_trip_ms
@@ -222,6 +223,7 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
             round_trip_ms = None
             decode_ms = None
             inference_ms = None
+            queue_wait_ms = None
             network_ms = None
             end_to_end_ms = shift_ms + storage_io_ms  # only disk read + content shift detection
             bandwidth_mbps = None
@@ -262,6 +264,7 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
             "round_trip_ms": rnd(round_trip_ms, 1),
             "decode_ms": rnd(decode_ms, 1),
             "inference_ms": rnd(inference_ms, 1),
+            "queue_wait_ms": rnd(queue_wait_ms, 1),
             "network_ms": rnd(network_ms, 1),
             "end_to_end_ms": rnd(end_to_end_ms, 1),
             "throughput_fps": round(throughput_fps, 1),
