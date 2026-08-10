@@ -45,6 +45,11 @@ CSV_HEADER = [
     "gate_mode", "inference_ran", "filter_rate",
     # cloud runtime that served this run, so backend comparisons are self-labelling
     "backend",
+    # --- cloud concurrency config, reported per response ---
+    # which model instance served this stream, and how many CPU threads it had.
+    # Lets a stream-count sweep be reconstructed from the edge CSV alone, and
+    # confirms each stream really did land on its own worker.
+    "worker_id", "infer_threads",
 ]
 
 # Instead of sampling CPU metrics per instance, sampling is done periodically
@@ -121,6 +126,8 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
     frames_late = 0            # frames that finished after their scheduled slot
     max_lag_ms = 0.0
     backend = None            # reported by the cloud on each /detect response
+    worker_id = None          # cloud model instance serving this stream
+    infer_threads = None      # CPU threads that instance was given
 
     csv_file = open(f"edge_metrics_stream{stream_id}.csv", "w", newline="")
     writer = csv.writer(csv_file)
@@ -192,6 +199,8 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
                 inference_ms = data.get("inference_ms", 0)
                 queue_wait_ms = data.get("queue_wait_ms", 0)
                 backend = data.get("backend")
+                worker_id = data.get("worker_id")
+                infer_threads = data.get("infer_threads")
             except requests.RequestException as e:
                 with print_lock:
                     print(f"[stream {stream_id}] Request failed: {e}")
@@ -288,6 +297,8 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
             # fraction of decoded frames that never reached the model so far
             "filter_rate": round(frames_skipped / frame_num, 3),
             "backend": backend,
+            "worker_id": worker_id,
+            "infer_threads": infer_threads,
         }
 
         # Print to terminal

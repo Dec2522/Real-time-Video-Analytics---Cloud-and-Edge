@@ -1,5 +1,7 @@
 import argparse
+import copy
 import csv
+import math
 import os
 
 from flask import Flask, request, jsonify
@@ -28,7 +30,9 @@ CLOUD_CSV_SUFFIX = [
     "mem_percent", "mem_used_mb", "net_sent_mb", "net_recv_mb",
     "proc_cpu", "proc_mem_mb", "load_avg",
     "inflight_requests", "active_streams",
-    "backend", "weights", "imgsz", "int8", "threads",
+    # `threads` is the per-worker inference thread cap; `workers` is how many
+    # model instances are sharing the box. threads*workers is the core budget.
+    "backend", "weights", "imgsz", "int8", "threads", "workers",
 ]
 
 # Inference backends. `pytorch` is the unoptimised baseline, the other two are
@@ -51,19 +55,29 @@ stream_info = {}
 # Avoid concurrent writes the shared data storage
 lock = threading.Lock()     
 
-# --- --- Detector --- ---
-# A single detector is shared across all streams.
-# The model is thread-safe, but per-stream tracking of object IDs is not.
-# To stop track IDs from different videos blending, the per-stream tracker state is swapped in and out around each call.
-# Why? Treat resource as a pool rather than a dedication per stream. And a model per stream is exspensive.
+# --- --- Detector pool --- ---
+# One model instance per worker, rather than one shared model behind a lock.
 #
-# Inference is deliberately serialised under model_lock rather than run concurrently:
-# on CPU the runtime already parallelises each convolution across all cores, so
-# letting N streams infer at once oversubscribes the cores instead of scaling.
-# Concurrency is exploited either side of this lock (decode, encode, transport).
-model = None                      # assigned in main() once the backend is known
-model_lock = threading.Lock()
-stream_trackers = {}              # stream_id - saved predictor.trackers list
+# The old design serialised every inference under a single model_lock. That lock
+# was not only a throughput choice - it was load-bearing for correctness, because
+# one YOLO instance owns one predictor, which owns one tracker list. Two streams
+# inferring at once on that predictor would blend their track IDs, so per-stream
+# tracker state had to be swapped in and out around every call.
+#
+# Giving each worker its own YOLO instance removes both problems at once: the
+# predictor, and therefore the tracker state, is private to the worker. Nothing
+# needs swapping and nothing needs a global lock, so streams infer genuinely in
+# parallel. Oversubscription is handled instead by capping each worker's model to
+# a slice of the cores (see _patch_thread_caps), so the workers partition the CPU
+# rather than each trying to use all of it.
+pool = []                         # list[Worker], built in main()
+stream_worker = {}                # stream_id -> Worker, fixed for the run
+assign_lock = threading.Lock()    # guards first-sight worker assignment
+
+# Detection settings live in one place so every worker is identical and results
+# stay comparable with the earlier single-model runs.
+CONF = 0.3
+VEHICLE_CLASSES = [2, 3, 5, 7]    # Classes = vehicles we want to detect
 
 # Inference resolution
 imgsz = DEFAULT_IMGSZ
@@ -71,28 +85,103 @@ imgsz = DEFAULT_IMGSZ
 # Describes the active backend, surfaced to the dashboard so a run can be
 # attributed to the runtime that produced it.
 runtime_info = {"backend": "pytorch", "weights": MODEL_WEIGHTS,
-                "imgsz": DEFAULT_IMGSZ, "int8": False, "torch_threads": None}
+                "imgsz": DEFAULT_IMGSZ, "int8": False, "torch_threads": None,
+                "workers": 1, "infer_threads": None}
 
 inflight = 0  # number of requests being processed
 inflight_lock = threading.Lock()
 
+# Thread cap applied to the NEXT model loaded. The patches installed by
+# _patch_thread_caps read this at load time, which is how each worker ends up
+# with its own bounded thread pool.
+_infer_threads = None
+_patched = False
 
-def export_path(weights, backend):
+
+def _patch_thread_caps(backend):
+    """Make the per-worker thread cap actually reach the inference runtime.
+
+    Ultralytics offers no way to pass runtime config through `YOLO(...)`, so the
+    relevant constructor is wrapped once, here. This matters more than it looks:
+    setting OMP_NUM_THREADS (as this server used to) does nothing to OpenVINO,
+    which ships a TBB build and ignores it. The only reliable knob is the
+    INFERENCE_NUM_THREADS property, supplied at compile time.
+    """
+    global _patched
+    if _patched:
+        return
+    _patched = True
+
+    if backend == "openvino":
+        import openvino as ov
+
+        orig_compile = ov.Core.compile_model
+
+        def compile_model(self, model, device_name=None, config=None, **kwargs):
+            cfg = dict(config or {})
+            if _infer_threads:
+                cfg["INFERENCE_NUM_THREADS"] = int(_infer_threads)
+                # Pinning is what turns "n threads" into "n dedicated cores".
+                # Without it the scheduler migrates threads between cores and
+                # the workers trample each other's cache. Not supported on every
+                # platform, hence the retry without it.
+                cfg["ENABLE_CPU_PINNING"] = True
+            try:
+                if device_name is None:
+                    return orig_compile(self, model, config=cfg, **kwargs)
+                return orig_compile(self, model, device_name, cfg, **kwargs)
+            except Exception:
+                cfg.pop("ENABLE_CPU_PINNING", None)
+                if device_name is None:
+                    return orig_compile(self, model, config=cfg, **kwargs)
+                return orig_compile(self, model, device_name, cfg, **kwargs)
+
+        ov.Core.compile_model = compile_model
+
+    elif backend == "onnx":
+        import onnxruntime
+
+        orig_init = onnxruntime.InferenceSession.__init__
+
+        def init(self, path_or_bytes, sess_options=None, providers=None, **kwargs):
+            if sess_options is None and _infer_threads:
+                sess_options = onnxruntime.SessionOptions()
+                sess_options.intra_op_num_threads = int(_infer_threads)
+                sess_options.inter_op_num_threads = 1
+            orig_init(self, path_or_bytes, sess_options=sess_options,
+                      providers=providers, **kwargs)
+
+        onnxruntime.InferenceSession.__init__ = init
+
+    # pytorch: torch.set_num_threads() is process-global, so it cannot differ per
+    # worker. It is applied once in main() instead - no loss, since every worker
+    # gets the same cap anyway.
+
+
+def export_path(weights, backend, int8=False):
     """Where ultralytics writes the exported artefact for this backend."""
     stem = os.path.splitext(weights)[0]
-    return f"{stem}_openvino_model" if backend == "openvino" else f"{stem}.onnx"
+    if backend == "openvino":
+        # The exporter suffixes int8 runs differently. Without this the cached
+        # export is never found, so --int8 re-exports every launch and then tries
+        # to load a directory that was never written.
+        return f"{stem}_int8_openvino_model" if int8 else f"{stem}_openvino_model"
+    return f"{stem}.onnx"
 
 
 def load_model(weights, backend, size, int8=False, data=None):
     """Load `weights` under the chosen backend, exporting on first use.
 
     The export is cached on disk, so only the first run of a given
-    (weights, backend, imgsz) combination pays the conversion cost.
+    (weights, backend, imgsz) combination pays the conversion cost. Called once
+    per worker: the export on disk is shared, the compiled instance is not.
     """
     if backend == "pytorch":
         return YOLO(weights)
 
-    target = export_path(weights, backend)
+    _patch_thread_caps(backend)
+
+    target = export_path(weights, backend, int8)
     if not os.path.exists(target):
         print(f"[server] exporting {weights} -> {backend} (imgsz={size}, int8={int8}); first run only")
         kwargs = {"format": backend, "imgsz": size}
@@ -111,30 +200,109 @@ def load_model(weights, backend, size, int8=False, data=None):
     return YOLO(target)
 
 
-def _swap_in_trackers(stream_id):
-    """Point the shared predictor at this stream's tracker state. Called with model_lock held.
+class Worker:
+    """One model instance and the streams pinned to it.
 
-    Relies on model having attributes predictor, tracker, reset. 
-    YOLO model used does, can't guarentee for others
+    A worker is the unit of parallelism: its model, predictor and tracker state
+    are private, so two workers never interact. `lock` therefore only contends
+    when more streams are running than there are workers and two of them landed
+    on the same one.
     """
-    predictor = getattr(model, "predictor", None)
-    # Avoid first call failure of 
-    if predictor is None:
-        return None
-    saved = stream_trackers.get(stream_id)
-    if saved is not None:
+
+    def __init__(self, idx, weights, backend, size, int8=False, data=None):
+        self.idx = idx
+        self.lock = threading.Lock()
+        self.streams = set()          # stream ids routed here
+        self.trackers = {}            # stream_id -> that stream's tracker list
+        self.pristine = None          # clean tracker list, forked for each new stream
+        self.model = load_model(weights, backend, size, int8, data)
+
+    def warmup(self, size):
+        """Run one dummy frame so predictor and trackers exist before real traffic.
+
+        This also avoids the first real request paying lazy-init cost, and takes
+        the clean tracker snapshot. When a worker has to serve a second stream,
+        that stream starts from a deep copy of this snapshot - which is what
+        keeps its track IDs independent instead of inheriting, or resetting,
+        another stream's state.
+        """
+        self.model.track(np.zeros((540, 960, 3), dtype=np.uint8), persist=True,
+                         imgsz=size, verbose=False)
+        predictor = getattr(self.model, "predictor", None)
+        if predictor is not None:
+            for t in predictor.trackers:
+                t.reset()
+            try:
+                self.pristine = copy.deepcopy(predictor.trackers)
+            except Exception as e:
+                print(f"[server] worker {self.idx}: tracker snapshot failed ({e}); "
+                      f"isolation degrades if this worker serves >1 stream")
+        self.trackers.clear()
+
+    def _swap_in(self, stream_id, predictor):
+        """Point this worker's predictor at `stream_id`'s tracker state.
+
+        Only reached when a worker serves more than one stream. Each stream gets
+        its own list of tracker objects - forked from the pristine snapshot, not
+        aliased to the predictor's current list - so their IDs stay separate.
+        """
+        saved = self.trackers.get(stream_id)
+        if saved is None:
+            if self.pristine is not None:
+                saved = copy.deepcopy(self.pristine)
+            else:
+                # No snapshot to fork from: fall back to resetting in place.
+                saved = predictor.trackers
+                for t in saved:
+                    t.reset()
         predictor.trackers = saved
-    else:
-        # If first frame of a stream, reset the trackers of the left over state fom previous stream
-        for t in predictor.trackers:
-            t.reset()
-    return predictor
+
+    def track(self, frame, stream_id):
+        """Track one frame. Returns (results, inference_ms, queue_wait_ms)."""
+        t_wait = time.time()
+        with self.lock:
+            t_infer = time.time()
+            # Fast path: a worker serving a single stream owns that stream's
+            # tracker outright, so there is nothing to swap.
+            shared = len(self.streams) > 1
+            predictor = getattr(self.model, "predictor", None)
+            if shared and predictor is not None:
+                self._swap_in(stream_id, predictor)
+
+            # run YOLO with track for persistent object IDs across frames
+            results = self.model.track(frame, persist=True, conf=CONF, verbose=False,
+                                       imgsz=imgsz,            # identical across backends
+                                       classes=VEHICLE_CLASSES)
+            inference_ms = (time.time() - t_infer) * 1000
+
+            if shared:
+                # predictor only exists after the first call - re-fetch on frame 1
+                predictor = predictor or getattr(self.model, "predictor", None)
+                if predictor is not None:
+                    self.trackers[stream_id] = predictor.trackers
+
+        # queue wait is time spent behind another stream on this worker: ~0 once
+        # workers >= streams, which is the whole point of the pool
+        return results, inference_ms, (t_infer - t_wait) * 1000
 
 
-def _swap_out_trackers(stream_id, predictor):
-    """Stash this stream's tracker state back. Called with model_lock held."""
-    if predictor is not None:
-        stream_trackers[stream_id] = predictor.trackers
+def worker_for(stream_id):
+    """Route a stream to its worker, assigning on first sight.
+
+    Assignment is round-robin over the pool and never changes for the life of the
+    run. Stickiness is not an optimisation: a stream's tracker lives inside one
+    worker, so moving a stream mid-run would restart its IDs from scratch and
+    inflate the unique-object count.
+    """
+    with assign_lock:
+        worker = stream_worker.get(stream_id)
+        if worker is None:
+            worker = pool[len(stream_worker) % len(pool)]
+            stream_worker[stream_id] = worker
+            worker.streams.add(stream_id)
+            note = "  (sharing - more streams than workers)" if len(worker.streams) > 1 else ""
+            print(f"[server] stream {stream_id} -> worker {worker.idx}{note}")
+        return worker
 
 
 def active_streams(now=None):
@@ -150,8 +318,11 @@ def run_tag(args):
     parts = [time.strftime("%Y%m%d-%H%M%S"), args.backend, stem, f"imgsz{args.imgsz}"]
     if args.int8:
         parts.append("int8")
-    if args.threads:
-        parts.append(f"t{args.threads}")
+    # workers and per-worker threads define the concurrency config, so both go in
+    # the filename - a sweep over stream counts otherwise produces identical stems
+    parts.append(f"w{args.workers}")
+    if args.infer_threads:
+        parts.append(f"t{args.infer_threads}")
     return "_".join(parts)
 
 
@@ -207,7 +378,8 @@ def sample_cloud_metrics(csv_path=None):
                         backend=runtime_info["backend"],
                         imgsz=runtime_info["imgsz"],
                         int8=runtime_info["int8"],
-                        threads=runtime_info["torch_threads"])
+                        threads=runtime_info["infer_threads"],
+                        workers=runtime_info["workers"])
             flat.update({f"cpu_core{i}": v for i, v in enumerate(record["cpu_per_core"])})
             writer.writerow([flat.get(c) for c in header])
             # Flushed every row - this thread is a daemon, so Ctrl-C kills the
@@ -228,23 +400,14 @@ def detect():
     frame = cv2.imdecode(arr, cv2.IMREAD_COLOR) # stays gray scale
     decode_ms = (time.time() - t0) * 1000 # log decode latency
 
+    # Each stream has its own worker (its own model), so this call runs in
+    # parallel with the other streams instead of queueing behind them.
+    worker = worker_for(stream_id)
+
     with inflight_lock:
         inflight += 1
     try:
-        t_wait = time.time()
-        # One model, one lock: streams queue here rather than inferring in parallel.
-        with model_lock:
-            t_infer = time.time()
-            predictor = _swap_in_trackers(stream_id)
-            # run YOLO with track for persistent object IDs across frames
-            results = model.track(frame, persist=True, conf=0.3, verbose=False,
-                                  imgsz=imgsz,          # identical across backends
-                                  classes=[2, 3, 5, 7]) # Classes = vehicles we want to detect
-            # predictor only exists after the first call - re-fetch on frame 1
-            _swap_out_trackers(stream_id, predictor or getattr(model, "predictor", None))
-            inference_ms = (time.time() - t_infer) * 1000 # log inference latency
-        # time spent queued behind other streams, kept separate from compute
-        queue_wait_ms = (t_infer - t_wait) * 1000
+        results, inference_ms, queue_wait_ms = worker.track(frame, stream_id)
     finally:
         with inflight_lock:
             inflight -= 1
@@ -277,8 +440,12 @@ def detect():
         "counts": counts,                          # per-label counts for THIS frame
         "decode_ms": round(decode_ms, 1),          # cloud-side JPEG decode time
         "inference_ms": round(inference_ms, 1),    # cloud-side compute time for THIS frame
-        "queue_wait_ms": round(queue_wait_ms, 1),  # time queued for model_lock behind other streams
+        "queue_wait_ms": round(queue_wait_ms, 1),  # time queued behind a stream sharing this worker
         "backend": runtime_info["backend"],        # so the edge CSV records which runtime served it
+        # which model instance served this frame, and how many cores it had -
+        # lets a sweep be reconstructed from the edge CSV alone
+        "worker_id": worker.idx,
+        "infer_threads": runtime_info["infer_threads"],
     })
 
 
@@ -325,7 +492,7 @@ def metrics_data():
 
 
 def main():
-    global model, imgsz
+    global imgsz, _infer_threads
 
     parser = argparse.ArgumentParser(description="Cloud inference service.")
     parser.add_argument("--backend", choices=BACKENDS, default="pytorch",
@@ -340,9 +507,16 @@ def main():
                         help="openvino only: INT8 quantisation (needs a calibration set)")
     parser.add_argument("--data", default=None,
                         help="dataset yaml used to calibrate --int8")
-    parser.add_argument("--threads", type=int, default=None,
-                        help="cap the runtime's CPU threads; pin this when comparing "
-                             "backends or sweeping stream counts")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="number of independent model instances. Set this to the "
+                             "number of streams you are about to run: each stream gets "
+                             "its own model, so they infer in parallel instead of "
+                             "queueing. 1 reproduces the old single-model behaviour")
+    parser.add_argument("--infer-threads", "--threads", dest="infer_threads",
+                        type=int, default=None,
+                        help="CPU threads per worker. Default splits the logical cores "
+                             "evenly across --workers (ceil), e.g. 8 cores: 1 worker=8, "
+                             "2 workers=4 each, 3 workers=3 each, 4 workers=2 each")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--csv", default=None,
                         help=f"cloud metrics CSV path (default: auto-named under {CSV_DIR}/)")
@@ -353,27 +527,40 @@ def main():
     if args.int8 and args.backend != "openvino":
         parser.error("--int8 applies to --backend openvino")
 
-    if args.threads is not None:
-        if args.threads < 1:
-            parser.error("--threads must be >= 1")
+    if args.workers < 1:
+        parser.error("--workers must be >= 1")
+
+    if args.infer_threads is not None and args.infer_threads < 1:
+        parser.error("--infer-threads must be >= 1")
+
+    # Split the cores across the workers. ceil, not floor, so 3 workers on 8
+    # cores get 3 threads each rather than 2 - the partition the sweep asks for.
+    cores = psutil.cpu_count(logical=True) or 1
+    threads = args.infer_threads or max(1, math.ceil(cores / args.workers))
+    args.infer_threads = threads     # so run_tag() labels the file with what was used
+    _infer_threads = threads         # read by _patch_thread_caps at load time
+
+    if args.backend == "pytorch":
+        # torch's thread count is process-global: one setting for every worker.
         import torch
-        torch.set_num_threads(args.threads)
-        # OpenVINO and ONNX Runtime read their thread counts from the environment
-        # rather than from torch, so set those too.
-        os.environ["OMP_NUM_THREADS"] = str(args.threads)
+        torch.set_num_threads(threads)
+    # Belt and braces for any OpenMP-linked component. Note this alone does NOT
+    # cap OpenVINO (TBB build) - that is handled at compile time in load_model.
+    os.environ["OMP_NUM_THREADS"] = str(threads)
 
     imgsz = args.imgsz
     runtime_info.update({"backend": args.backend, "weights": args.weights,
                          "imgsz": args.imgsz, "int8": args.int8,
-                         "torch_threads": args.threads})
+                         "torch_threads": threads, "workers": args.workers,
+                         "infer_threads": threads})
 
-    model = load_model(args.weights, args.backend, args.imgsz, args.int8, args.data)
-
-    # Warm the model once so the first real request isn't paying lazy-init cost,
-    # and so predictor/trackers exist before any stream swaps state in.
-    model.track(np.zeros((540, 960, 3), dtype=np.uint8), persist=True,
-                imgsz=args.imgsz, verbose=False)
-    stream_trackers.clear()
+    # Build the pool. Each worker loads its own instance from the same export on
+    # disk, and is warmed so no stream pays lazy-init cost on its first frame.
+    for i in range(args.workers):
+        worker = Worker(i, args.weights, args.backend, args.imgsz, args.int8, args.data)
+        worker.warmup(args.imgsz)
+        pool.append(worker)
+        print(f"[server] worker {i} ready ({threads} threads)")
 
     csv_path = None
     if args.write_csv:
@@ -385,7 +572,8 @@ def main():
     threading.Thread(target=sample_cloud_metrics, args=(csv_path,), daemon=True).start()
 
     print(f"[server] backend={args.backend} weights={args.weights} "
-          f"imgsz={args.imgsz} int8={args.int8} threads={args.threads or 'auto'}")
+          f"imgsz={args.imgsz} int8={args.int8} "
+          f"workers={args.workers} threads/worker={threads} (of {cores} cores)")
     app.run(host="0.0.0.0", port=args.port, threaded=True)
 
 
