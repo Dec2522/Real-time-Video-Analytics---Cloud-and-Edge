@@ -95,6 +95,7 @@ inflight_lock = threading.Lock()
 # _patch_thread_caps read this at load time, which is how each worker ends up
 # with its own bounded thread pool.
 _infer_threads = None
+_pin_cpus = True      # set from --no-pin; see _patch_thread_caps
 _patched = False
 
 
@@ -121,11 +122,13 @@ def _patch_thread_caps(backend):
             cfg = dict(config or {})
             if _infer_threads:
                 cfg["INFERENCE_NUM_THREADS"] = int(_infer_threads)
-                # Pinning is what turns "n threads" into "n dedicated cores".
-                # Without it the scheduler migrates threads between cores and
-                # the workers trample each other's cache. Not supported on every
-                # platform, hence the retry without it.
-                cfg["ENABLE_CPU_PINNING"] = True
+                # Pinning is meant to turn "n threads" into "n dedicated cores".
+                # It can backfire with a pool: ultralytics builds a fresh ov.Core
+                # per model, and if those don't share a CPU reservation table each
+                # worker pins onto the same cores instead of claiming its own.
+                # --no-pin turns it off so the OS spreads the threads instead.
+                if _pin_cpus:
+                    cfg["ENABLE_CPU_PINNING"] = True
             try:
                 if device_name is None:
                     return orig_compile(self, model, config=cfg, **kwargs)
@@ -492,7 +495,7 @@ def metrics_data():
 
 
 def main():
-    global imgsz, _infer_threads
+    global imgsz, _infer_threads, _pin_cpus
 
     parser = argparse.ArgumentParser(description="Cloud inference service.")
     parser.add_argument("--backend", choices=BACKENDS, default="pytorch",
@@ -517,6 +520,10 @@ def main():
                         help="CPU threads per worker. Default splits the logical cores "
                              "evenly across --workers (ceil), e.g. 8 cores: 1 worker=8, "
                              "2 workers=4 each, 3 workers=3 each, 4 workers=2 each")
+    parser.add_argument("--no-pin", dest="pin", action="store_false",
+                        help="don't pin each worker's threads to cores. Try this if "
+                             "the workers all land on the same cores instead of "
+                             "spreading across them")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--csv", default=None,
                         help=f"cloud metrics CSV path (default: auto-named under {CSV_DIR}/)")
@@ -539,6 +546,7 @@ def main():
     threads = args.infer_threads or max(1, math.ceil(cores / args.workers))
     args.infer_threads = threads     # so run_tag() labels the file with what was used
     _infer_threads = threads         # read by _patch_thread_caps at load time
+    _pin_cpus = args.pin
 
     if args.backend == "pytorch":
         # torch's thread count is process-global: one setting for every worker.
@@ -573,7 +581,8 @@ def main():
 
     print(f"[server] backend={args.backend} weights={args.weights} "
           f"imgsz={args.imgsz} int8={args.int8} "
-          f"workers={args.workers} threads/worker={threads} (of {cores} cores)")
+          f"workers={args.workers} threads/worker={threads} (of {cores} cores) "
+          f"pinning={'on' if args.pin else 'off'}")
     app.run(host="0.0.0.0", port=args.port, threaded=True)
 
 
