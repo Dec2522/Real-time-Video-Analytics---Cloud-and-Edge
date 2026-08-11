@@ -95,8 +95,25 @@ inflight_lock = threading.Lock()
 # _patch_thread_caps read this at load time, which is how each worker ends up
 # with its own bounded thread pool.
 _infer_threads = None
-_pin_cpus = True      # set from --no-pin; see _patch_thread_caps
+_pin_cpus = True      # set from --no-pin; see Worker._apply_affinity
 _patched = False
+
+# Whether this platform can pin threads to cores at all (Linux: yes).
+CAN_PIN = hasattr(os, "sched_setaffinity")
+
+
+def core_slice(idx, threads, cores):
+    """The cores worker `idx` runs on: `threads` of them, starting where the
+    previous worker left off.
+
+    4 workers x 2 threads on 8 cores -> {0,1} {2,3} {4,5} {6,7}: no overlap, so
+    the workers genuinely run side by side instead of contending. When
+    workers*threads exceeds the core count (3 x 3 on 8) the last slice wraps and
+    shares a core with the first - deliberate, since the alternative is leaving
+    a worker with fewer threads than it was compiled for.
+    """
+    start = (idx * threads) % cores
+    return sorted({(start + j) % cores for j in range(min(threads, cores))})
 
 
 def _patch_thread_caps(backend):
@@ -122,13 +139,13 @@ def _patch_thread_caps(backend):
             cfg = dict(config or {})
             if _infer_threads:
                 cfg["INFERENCE_NUM_THREADS"] = int(_infer_threads)
-                # Pinning is meant to turn "n threads" into "n dedicated cores".
-                # It can backfire with a pool: ultralytics builds a fresh ov.Core
-                # per model, and if those don't share a CPU reservation table each
-                # worker pins onto the same cores instead of claiming its own.
-                # --no-pin turns it off so the OS spreads the threads instead.
-                if _pin_cpus:
-                    cfg["ENABLE_CPU_PINNING"] = True
+            # OpenVINO's own ENABLE_CPU_PINNING is deliberately NOT set here.
+            # Ultralytics builds a separate ov.Core per model, so each worker's
+            # plugin believes it owns the whole machine and pins to the same
+            # low-numbered cores - four workers all land on cores 0-1. Core
+            # placement is done with OS affinity in Worker instead, where the
+            # allocation is explicit and non-overlapping.
+            cfg["ENABLE_CPU_PINNING"] = False
             try:
                 if device_name is None:
                     return orig_compile(self, model, config=cfg, **kwargs)
@@ -212,13 +229,44 @@ class Worker:
     on the same one.
     """
 
-    def __init__(self, idx, weights, backend, size, int8=False, data=None):
+    def __init__(self, idx, weights, backend, size, int8=False, data=None, cores=None):
         self.idx = idx
         self.lock = threading.Lock()
         self.streams = set()          # stream ids routed here
         self.trackers = {}            # stream_id -> that stream's tracker list
         self.pristine = None          # clean tracker list, forked for each new stream
-        self.model = load_model(weights, backend, size, int8, data)
+        self.cores = cores            # the cores this worker is confined to
+        self._pinned = threading.local()
+
+        # Load under this worker's affinity mask. The runtime spawns its thread
+        # pool during compile, and those threads inherit the mask of the thread
+        # that created them - which is how each worker ends up on its own cores.
+        self._apply_affinity()
+        try:
+            self.model = load_model(weights, backend, size, int8, data)
+        finally:
+            self._release_affinity()
+
+    def _apply_affinity(self):
+        """Confine the calling thread to this worker's cores."""
+        if self.cores and _pin_cpus and CAN_PIN:
+            os.sched_setaffinity(0, self.cores)
+
+    def _release_affinity(self):
+        """Hand the calling thread back the whole machine."""
+        if _pin_cpus and CAN_PIN:
+            os.sched_setaffinity(0, range(psutil.cpu_count(logical=True) or 1))
+
+    def _pin_this_thread(self):
+        """Pin the current request thread to this worker's cores, once.
+
+        Inference runs partly on the calling thread, so without this the Flask
+        thread would float across the machine while the pool threads stayed put.
+        Cheap: one syscall the first time a given thread serves this worker.
+        """
+        if not getattr(self._pinned, "done", False):
+            self._apply_affinity()
+            self._pinned.done = True
 
     def warmup(self, size):
         """Run one dummy frame so predictor and trackers exist before real traffic.
@@ -229,8 +277,12 @@ class Worker:
         keeps its track IDs independent instead of inheriting, or resetting,
         another stream's state.
         """
-        self.model.track(np.zeros((540, 960, 3), dtype=np.uint8), persist=True,
-                         imgsz=size, verbose=False)
+        self._apply_affinity()
+        try:
+            self.model.track(np.zeros((540, 960, 3), dtype=np.uint8), persist=True,
+                             imgsz=size, verbose=False)
+        finally:
+            self._release_affinity()
         predictor = getattr(self.model, "predictor", None)
         if predictor is not None:
             for t in predictor.trackers:
@@ -262,6 +314,7 @@ class Worker:
 
     def track(self, frame, stream_id):
         """Track one frame. Returns (results, inference_ms, queue_wait_ms)."""
+        self._pin_this_thread()
         t_wait = time.time()
         with self.lock:
             t_infer = time.time()
@@ -521,9 +574,9 @@ def main():
                              "evenly across --workers (ceil), e.g. 8 cores: 1 worker=8, "
                              "2 workers=4 each, 3 workers=3 each, 4 workers=2 each")
     parser.add_argument("--no-pin", dest="pin", action="store_false",
-                        help="don't pin each worker's threads to cores. Try this if "
-                             "the workers all land on the same cores instead of "
-                             "spreading across them")
+                        help="don't confine each worker to its own cores; let the OS "
+                             "schedule all workers across the whole machine. Useful as "
+                             "a comparison point against the pinned allocation")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--csv", default=None,
                         help=f"cloud metrics CSV path (default: auto-named under {CSV_DIR}/)")
@@ -565,10 +618,12 @@ def main():
     # Build the pool. Each worker loads its own instance from the same export on
     # disk, and is warmed so no stream pays lazy-init cost on its first frame.
     for i in range(args.workers):
-        worker = Worker(i, args.weights, args.backend, args.imgsz, args.int8, args.data)
+        cores_for_worker = core_slice(i, threads, cores)
+        worker = Worker(i, args.weights, args.backend, args.imgsz, args.int8,
+                        args.data, cores_for_worker)
         worker.warmup(args.imgsz)
         pool.append(worker)
-        print(f"[server] worker {i} ready ({threads} threads)")
+        print(f"[server] worker {i} ready ({threads} threads on cores {cores_for_worker})")
 
     csv_path = None
     if args.write_csv:

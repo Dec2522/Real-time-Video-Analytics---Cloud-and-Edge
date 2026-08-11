@@ -132,6 +132,7 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
     csv_file = open(f"edge_metrics_stream{stream_id}.csv", "w", newline="")
     writer = csv.writer(csv_file)
     writer.writerow(CSV_HEADER)
+    csv_file.flush()
 
     while cap.isOpened():
         # read frame from disk and time it
@@ -310,6 +311,10 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
 
         #  CSV log
         writer.writerow([record[k] for k in CSV_HEADER])
+        # Flushed every row: these threads are daemons, so Ctrl-C kills the
+        # process without closing the file and anything still buffered is lost.
+        # Same reason the cloud metrics CSV flushes per row.
+        csv_file.flush()
 
         # push metrics to cloud dashboard every N frames - regardless of gate mode
         if frame_num % PUSH_EVERY == 0:
