@@ -238,14 +238,14 @@ class Worker:
         self.cores = cores            # the cores this worker is confined to
         self._pinned = threading.local()
 
-        # Load under this worker's affinity mask. The runtime spawns its thread
-        # pool during compile, and those threads inherit the mask of the thread
-        # that created them - which is how each worker ends up on its own cores.
-        self._apply_affinity()
-        try:
-            self.model = load_model(weights, backend, size, int8, data)
-        finally:
-            self._release_affinity()
+        # NOT loaded under an affinity mask, deliberately. OpenVINO runs on TBB,
+        # which keeps ONE thread pool per process: separate compiled models get
+        # separate task arenas but share the underlying worker threads. Those
+        # threads are created during the first compile, so masking the loading
+        # thread pins the whole shared pool to the first worker's cores and every
+        # worker then contends for them. In-process workers can be given a thread
+        # budget (INFERENCE_NUM_THREADS) but not private cores.
+        self.model = load_model(weights, backend, size, int8, data)
 
     def _apply_affinity(self):
         """Confine the calling thread to this worker's cores."""
@@ -277,12 +277,8 @@ class Worker:
         keeps its track IDs independent instead of inheriting, or resetting,
         another stream's state.
         """
-        self._apply_affinity()
-        try:
-            self.model.track(np.zeros((540, 960, 3), dtype=np.uint8), persist=True,
-                             imgsz=size, verbose=False)
-        finally:
-            self._release_affinity()
+        self.model.track(np.zeros((540, 960, 3), dtype=np.uint8), persist=True,
+                         imgsz=size, verbose=False)
         predictor = getattr(self.model, "predictor", None)
         if predictor is not None:
             for t in predictor.trackers:
@@ -573,10 +569,11 @@ def main():
                         help="CPU threads per worker. Default splits the logical cores "
                              "evenly across --workers (ceil), e.g. 8 cores: 1 worker=8, "
                              "2 workers=4 each, 3 workers=3 each, 4 workers=2 each")
-    parser.add_argument("--no-pin", dest="pin", action="store_false",
-                        help="don't confine each worker to its own cores; let the OS "
-                             "schedule all workers across the whole machine. Useful as "
-                             "a comparison point against the pinned allocation")
+    parser.add_argument("--pin", action="store_true",
+                        help="confine each request thread to its worker's cores. Off by "
+                             "default: OpenVINO's TBB pool is process-wide, so in-process "
+                             "workers cannot get truly private cores and masking tends to "
+                             "concentrate them instead of spreading them")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--csv", default=None,
                         help=f"cloud metrics CSV path (default: auto-named under {CSV_DIR}/)")
