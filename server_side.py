@@ -3,6 +3,7 @@ import copy
 import csv
 import math
 import os
+import shutil
 
 from flask import Flask, request, jsonify
 from ultralytics import YOLO
@@ -178,8 +179,8 @@ def _patch_thread_caps(backend):
     # gets the same cap anyway.
 
 
-def export_path(weights, backend, int8=False):
-    """Where ultralytics writes the exported artefact for this backend."""
+def ultralytics_export_path(weights, backend, int8=False):
+    """Where ultralytics itself writes the export - no imgsz in its naming."""
     stem = os.path.splitext(weights)[0]
     if backend == "openvino":
         # The exporter suffixes int8 runs differently. Without this the cached
@@ -189,19 +190,33 @@ def export_path(weights, backend, int8=False):
     return f"{stem}.onnx"
 
 
+def export_path(weights, backend, size, int8=False):
+    """Where this build is cached - keyed on imgsz as well as backend.
+
+    An exported artefact has a STATIC input shape, so one exported at 640 cannot
+    serve a 960 request; it just quietly runs at 640. Caching under ultralytics'
+    imgsz-free name meant the first export won permanently and every later
+    --imgsz was silently ignored on openvino/onnx.
+    """
+    base = ultralytics_export_path(weights, backend, int8)
+    if backend == "openvino":
+        return f"{base}_imgsz{size}"
+    return f"{os.path.splitext(base)[0]}_imgsz{size}.onnx"
+
+
 def load_model(weights, backend, size, int8=False, data=None):
     """Load `weights` under the chosen backend, exporting on first use.
 
     The export is cached on disk, so only the first run of a given
-    (weights, backend, imgsz) combination pays the conversion cost. Called once
-    per worker: the export on disk is shared, the compiled instance is not.
+    (weights, backend, imgsz, int8) combination pays the conversion cost. Called
+    once per worker: the export on disk is shared, the compiled instance is not.
     """
     if backend == "pytorch":
         return YOLO(weights)
 
     _patch_thread_caps(backend)
 
-    target = export_path(weights, backend, int8)
+    target = export_path(weights, backend, size, int8)
     if not os.path.exists(target):
         print(f"[server] exporting {weights} -> {backend} (imgsz={size}, int8={int8}); first run only")
         kwargs = {"format": backend, "imgsz": size}
@@ -216,8 +231,35 @@ def load_model(weights, backend, size, int8=False, data=None):
                 kwargs["data"] = data
         YOLO(weights).export(**kwargs)
 
+        # Rehome under the imgsz-keyed name, before the next resolution's export
+        # overwrites the path ultralytics just wrote to.
+        produced = ultralytics_export_path(weights, backend, int8)
+        if os.path.exists(produced):
+            if os.path.isdir(target):
+                shutil.rmtree(target)
+            elif os.path.exists(target):
+                os.remove(target)
+            shutil.move(produced, target)
+
     print(f"[server] loading {target}")
     return YOLO(target)
+
+
+def effective_imgsz(model):
+    """The input size a loaded model actually runs at, read back after warmup.
+
+    Read defensively - it is a diagnostic, and no ultralytics version guarantees
+    where this lives.
+    """
+    predictor = getattr(model, "predictor", None)
+    for obj in (getattr(predictor, "model", None), predictor,
+                getattr(predictor, "args", None), model):
+        size = getattr(obj, "imgsz", None)
+        if isinstance(size, (list, tuple)) and len(size) >= 2:
+            return [int(size[0]), int(size[1])]
+        if isinstance(size, int) and size > 0:
+            return [size, size]
+    return None
 
 
 class Worker:
@@ -469,13 +511,19 @@ def detect():
     # If there are detections:
     # One line per object - ID: Label: Confidence:
     if boxes.id is not None:
-        for tid, cls, conf in zip(
+        # xywhn is normalised centre form, already computed - the edge uses it to
+        # derive density (how small/crowded the boxes are) and per-track
+        # displacement (how fast the scene moves) without running a model itself.
+        for tid, cls, conf, (cx, cy, bw, bh) in zip(
             boxes.id.int().tolist(),
             boxes.cls.int().tolist(),
             boxes.conf.tolist(),
+            boxes.xywhn.tolist(),
         ):
             dets.append({"id": tid, "label": results[0].names[cls],
-                         "conf": round(conf, 2)})
+                         "conf": round(conf, 2),
+                         "cx": round(cx, 4), "cy": round(cy, 4),
+                         "w": round(bw, 4), "h": round(bh, 4)})
 
     # Count labels
     labels = [d["label"] for d in dets]
@@ -498,6 +546,7 @@ def detect():
         # lets a sweep be reconstructed from the edge CSV alone
         "worker_id": worker.idx,
         "infer_threads": runtime_info["infer_threads"],
+        "served_imgsz": runtime_info["imgsz"],     # resolution this frame really ran at
     })
 
 
@@ -621,6 +670,16 @@ def main():
         worker.warmup(args.imgsz)
         pool.append(worker)
         print(f"[server] worker {i} ready ({threads} threads on cores {cores_for_worker})")
+
+    # Confirm the artefact really runs at the requested resolution, so a bad
+    # cache shows up here instead of invalidating a whole imgsz sweep silently.
+    got = effective_imgsz(pool[0].model)
+    if got and got[0] != args.imgsz:
+        print(f"[server] WARNING: asked for imgsz={args.imgsz}, loaded model runs at "
+              f"{got[0]}x{got[1]}. Delete {export_path(args.weights, args.backend, args.imgsz, args.int8)} "
+              f"and restart to re-export.")
+    elif got:
+        print(f"[server] confirmed inference resolution {got[0]}x{got[1]}")
 
     csv_path = None
     if args.write_csv:
