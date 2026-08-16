@@ -49,7 +49,13 @@ DEFAULT_FRAME_GAP = 5
 # can be stated: infer before any box has drifted more than this fraction of the
 # frame width. Requires box centres, so it only works against a cloud that
 # returns them.
-DEFAULT_MOTION_BUDGET = 0.04   # normalised frame widths of drift to allow
+# The budget accumulates the FASTEST box's drift, not the mean. Association is
+# per object: a track is lost once its own predicted box stops overlapping its
+# detection, so one fast vehicle breaks while the rest of the scene is still
+# tracked fine. Gating on the mean hides exactly the object that fails first.
+# Scale: at IoU 0.5 two same-size boxes can be offset by about a third of a box
+# width, and vehicles here are roughly 0.09 wide normalised - hence 0.03.
+DEFAULT_MOTION_BUDGET = 0.03   # normalised frame widths of drift to allow
 MOTION_ALPHA = 0.2             # EWMA weight on the measured displacement rate
 
 # --- density (spatial) signals ---
@@ -116,9 +122,12 @@ CSV_HEADER = [
     "mean_conf", "low_conf_frac", "overlap_pairs",
     "density_metric", "density_ewma", "density_state",
     # --- motion (temporal) signals: how fast the scene is moving ---
-    # disp_* are normalised frame widths per frame. disp_accum is the predicted
-    # drift since the last inference, as it stood when this frame was gated.
-    "disp_rate", "disp_rate_max", "disp_rate_ewma", "tracks_matched", "disp_accum",
+    # disp_* are normalised frame widths per frame. The 'motion' gate spends
+    # disp_rate_max_ewma; the mean is logged alongside for comparison.
+    # disp_accum is the predicted drift since the last inference, as it stood
+    # when this frame was gated.
+    "disp_rate", "disp_rate_max", "disp_rate_ewma", "disp_rate_max_ewma",
+    "tracks_matched", "disp_accum",
 ]
 
 # Instead of sampling CPU metrics per instance, sampling is done periodically
@@ -302,7 +311,9 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
     last_infer_frame = None
     disp_rate = None
     disp_rate_max = None
-    disp_rate_ewma = None     # None until two inferred frames share a track ID
+    disp_rate_ewma = None       # mean drift - logged, not spent
+    disp_rate_max_ewma = None   # what the gate spends. None until two inferred
+                                # frames share a track ID
     tracks_matched = 0
     disp_accum = 0.0
 
@@ -346,10 +357,10 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
         # carries the change that actually triggered it.
         change_since_infer = diff_accum
 
-        # Predicted drift since the last inference. Unlike diff_accum this is a
-        # forecast, not a measurement - a gated frame has no fresh boxes to
-        # measure from, so the last known rate is extrapolated forward.
-        disp_accum += disp_rate_ewma or 0.0
+        # Predicted drift of the fastest box since the last inference. Unlike
+        # diff_accum this is a forecast, not a measurement - a gated frame has no
+        # fresh boxes to measure from, so the last known rate is extrapolated.
+        disp_accum += disp_rate_max_ewma or 0.0
         motion_since_infer = disp_accum
 
         # Decide whether to run inference on this frame based on gating mode defined
@@ -368,7 +379,7 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
             run_inference = diff_accum >= diff_budget or forced_by_floor
         elif gate_mode == "motion":
             forced_by_floor = skipped_since_infer >= max_skip
-            if disp_rate_ewma is None:
+            if disp_rate_max_ewma is None:
                 # No rate yet: it takes two inferred frames sharing a track for
                 # one to exist, so infer back to back until they do - but only
                 # while there is a track to wait for. With nothing detected there
@@ -425,7 +436,7 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
             if last_infer_frame is not None:
                 disp_rate, disp_rate_max, tracks_matched = track_displacement(
                     last_dets, dets, frame_num - last_infer_frame)
-                if disp_rate is None and not dets and disp_rate_ewma is not None:
+                if disp_rate is None and not dets and disp_rate_max_ewma is not None:
                     # Empty scene: nothing on screen can go stale, so the rate is
                     # genuinely zero rather than unmeasurable.
                     # Only once a real rate exists, though - the tracker returns
@@ -436,6 +447,9 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
                 if disp_rate is not None:
                     disp_rate_ewma = (disp_rate if disp_rate_ewma is None else
                                       MOTION_ALPHA * disp_rate + (1 - MOTION_ALPHA) * disp_rate_ewma)
+                    disp_rate_max_ewma = (disp_rate_max if disp_rate_max_ewma is None else
+                                          MOTION_ALPHA * disp_rate_max
+                                          + (1 - MOTION_ALPHA) * disp_rate_max_ewma)
 
             density = density_signals(dets)
             metric_value = density[DENSITY_METRICS[density_metric]] or 0.0
@@ -573,6 +587,7 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
             "disp_rate": rnd(disp_rate, 5),
             "disp_rate_max": rnd(disp_rate_max, 5),
             "disp_rate_ewma": rnd(disp_rate_ewma, 5),
+            "disp_rate_max_ewma": rnd(disp_rate_max_ewma, 5),
             "tracks_matched": tracks_matched,
             "disp_accum": round(motion_since_infer, 5),
         }
@@ -623,7 +638,8 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
             gate_detail = f"budget={diff_budget:g} max_skip={max_skip} floor_hits={budget_floor_hits} "
         elif gate_mode == "motion":
             gate_detail = (f"motion_budget={motion_budget:g} max_skip={max_skip} "
-                           f"floor_hits={budget_floor_hits} final_rate={disp_rate_ewma or 0:.4f} ")
+                           f"floor_hits={budget_floor_hits} "
+                           f"final_max_rate={disp_rate_max_ewma or 0:.4f} ")
         else:
             gate_detail = ""
         print(f"stream {stream_id} COMPLETE: gate={gate_mode} {gate_detail}{pacing_desc}"
@@ -667,12 +683,13 @@ def main():
                              f"many consecutive frames, whatever the budget says - bounds "
                              f"the worst-case miss (default {DEFAULT_MAX_SKIP})")
     parser.add_argument("--motion-budget", type=float, default=DEFAULT_MOTION_BUDGET,
-                        help=f"'motion' gate only: infer once a tracked box is predicted "
-                             f"to have drifted this far, as a fraction of frame width "
-                             f"(default {DEFAULT_MOTION_BUDGET:g}). Unlike --budget this "
-                             f"is directly interpretable - 0.04 means 'never let a box go "
-                             f"more than 4%% of the frame stale'. Profile the disp_rate_ewma "
-                             f"column of an ungated run to see what a scene actually costs")
+                        help=f"'motion' gate only: infer once the FASTEST tracked box is "
+                             f"predicted to have drifted this far, as a fraction of frame "
+                             f"width (default {DEFAULT_MOTION_BUDGET:g}). Unlike --budget this "
+                             f"is directly interpretable - it is the staleness you allow the "
+                             f"worst-case object, and association fails at roughly a third of "
+                             f"a box width. Profile disp_rate_max_ewma on an ungated run and "
+                             f"divide the budget by it to get the skip length")
     parser.add_argument("--density-metric", choices=sorted(DENSITY_METRICS),
                         default=DEFAULT_DENSITY_METRIC,
                         help=f"which spatial signal drives the logged density state "
