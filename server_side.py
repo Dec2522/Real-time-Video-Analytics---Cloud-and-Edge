@@ -5,7 +5,7 @@ import math
 import os
 import shutil
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from ultralytics import YOLO
 import cv2 
 import numpy as np
@@ -21,6 +21,10 @@ HISTORY_LEN = 300          # samples retained per series for the dashboard
 STREAM_TIMEOUT_S = 15      # no traffic for this long => stream counted as finished
 
 CSV_DIR = "results"        # cloud metrics CSVs land here, one per run
+
+# The dashboard is served from here rather than a separate http.server, so it
+# shares an origin with /metrics/data - one forwarded port, no CORS.
+DASHBOARD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard")
 
 # Cloud metrics CSV layout. The per-core columns sit between these two blocks and
 # are generated at open time, since the core count isn't known until runtime.
@@ -563,6 +567,12 @@ def receive_metrics():
         if data.get("video"):
             info["video"] = data["video"]
     return jsonify({"status": "ok"})
+
+
+@app.route("/")
+def dashboard():
+    """Serve the dashboard, so it and the metrics endpoint share an origin."""
+    return send_from_directory(DASHBOARD_DIR, "index.html")
 
 
 @app.route("/metrics/data")
