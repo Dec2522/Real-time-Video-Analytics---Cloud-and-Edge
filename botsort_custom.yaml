@@ -1,0 +1,25 @@
+# BoT-SORT tuned for gated streams, where consecutive tracker steps are several
+# real frames apart. Byte-for-byte ultralytics' default except match_thresh.
+tracker_type: botsort
+
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.25
+track_buffer: 30
+fuse_score: True
+
+# THE ONLY DEVIATION FROM DEFAULT (0.8). It is a ceiling on matching COST, and
+# cost is (1 - IoU), so this is really an IoU floor of (1 - match_thresh). The
+# default demands IoU >= 0.2, which a vehicle cannot clear once it has drifted
+# much past a third of its own width between inferences. Boxes here are ~0.09
+# wide normalised and the fastest move ~0.025 per frame, so a 3-frame gap leaves
+# IoU ~0.09 and association fails - the observed cliff. 0.95 drops the floor to
+# 0.05 and lets 3-6 frame gaps hold.
+match_thresh: 0.95
+
+gmc_method: sparseOptFlow
+
+proximity_thresh: 0.5
+appearance_thresh: 0.8
+with_reid: False
+model: auto
