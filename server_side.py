@@ -80,6 +80,15 @@ assign_lock = threading.Lock()    # guards first-sight worker assignment
 CONF = 0.3
 VEHICLE_CLASSES = [2, 3, 5, 7]    # Classes = vehicles we want to detect
 
+# Gating means consecutive tracker steps can be several real frames apart, which
+# the stock association thresholds are not built for. Falls back to ultralytics'
+# default if the file is missing, so a stale checkout still runs.
+TRACKER_CFG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "botsort_custom.yaml")
+if not os.path.exists(TRACKER_CFG):
+    print(f"[server] {os.path.basename(TRACKER_CFG)} not found; using stock botsort.yaml")
+    TRACKER_CFG = "botsort.yaml"
+
 # Inference resolution
 imgsz = DEFAULT_IMGSZ
 
@@ -319,10 +328,23 @@ class Worker:
         keeps its track IDs independent instead of inheriting, or resetting,
         another stream's state.
         """
+        # The tracker config is only read when the trackers are built, which is
+        # this call - passing it later with persist=True has no effect.
         self.model.track(np.zeros((540, 960, 3), dtype=np.uint8), persist=True,
-                         imgsz=size, verbose=False)
+                         imgsz=size, verbose=False, tracker=TRACKER_CFG)
         predictor = getattr(self.model, "predictor", None)
         if predictor is not None:
+            # Read the thresholds back off the built tracker rather than trusting
+            # the yaml was found and parsed. A silently-ignored config looks
+            # exactly like a config that did not help.
+            if self.idx == 0 and predictor.trackers:
+                a = getattr(predictor.trackers[0], "args", None)
+                if a is not None:
+                    print(f"[server] tracker {getattr(a, 'tracker_type', '?')}: "
+                          f"match_thresh={getattr(a, 'match_thresh', '?')} "
+                          f"(IoU floor {1 - getattr(a, 'match_thresh', 0):.2f}) "
+                          f"new_track_thresh={getattr(a, 'new_track_thresh', '?')} "
+                          f"track_buffer={getattr(a, 'track_buffer', '?')}")
             for t in predictor.trackers:
                 t.reset()
             try:
@@ -366,7 +388,8 @@ class Worker:
             # run YOLO with track for persistent object IDs across frames
             results = self.model.track(frame, persist=True, conf=CONF, verbose=False,
                                        imgsz=imgsz,            # identical across backends
-                                       classes=VEHICLE_CLASSES)
+                                       classes=VEHICLE_CLASSES,
+                                       tracker=TRACKER_CFG)
             inference_ms = (time.time() - t_infer) * 1000
 
             if shared:
