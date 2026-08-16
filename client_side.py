@@ -370,9 +370,13 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
             forced_by_floor = skipped_since_infer >= max_skip
             if disp_rate_ewma is None:
                 # No rate yet: it takes two inferred frames sharing a track for
-                # one to exist, so infer back to back until they do. In a scene
-                # whose objects never persist this degrades to 'none'.
-                run_inference = True
+                # one to exist, so infer back to back until they do - but only
+                # while there is a track to wait for. With nothing detected there
+                # is nothing to bootstrap from, so coast on the floor instead of
+                # inferring every frame at an empty camera. Costs one floor
+                # interval at startup, while the tracker confirms its first
+                # tracks and reports nothing.
+                run_inference = bool(last_dets) or forced_by_floor
             else:
                 run_inference = disp_accum >= motion_budget or forced_by_floor
         else:  # adaptive
@@ -421,10 +425,13 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
             if last_infer_frame is not None:
                 disp_rate, disp_rate_max, tracks_matched = track_displacement(
                     last_dets, dets, frame_num - last_infer_frame)
-                if disp_rate is None and not dets:
+                if disp_rate is None and not dets and disp_rate_ewma is not None:
                     # Empty scene: nothing on screen can go stale, so the rate is
-                    # genuinely zero rather than unmeasurable. Without this an
-                    # empty road would infer every frame, which is backwards.
+                    # genuinely zero rather than unmeasurable.
+                    # Only once a real rate exists, though - the tracker returns
+                    # no detections for its first few frames while it confirms
+                    # tracks, and folding those zeros in would pin the EWMA at 0
+                    # before it had ever measured anything.
                     disp_rate = disp_rate_max = 0.0
                 if disp_rate is not None:
                     disp_rate_ewma = (disp_rate if disp_rate_ewma is None else
