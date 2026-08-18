@@ -94,8 +94,16 @@ imgsz = DEFAULT_IMGSZ
 
 # Describes the active backend, surfaced to the dashboard so a run can be
 # attributed to the runtime that produced it.
+#
+# `imgsz` is what was ASKED for; `effective_imgsz` is what the loaded artefact
+# actually runs at, read back off the model after warmup. They can differ - an
+# exported openvino/onnx artefact has a static input shape, so a stale cache
+# quietly serves the resolution it was built at. Only the effective value is
+# reported to the edge: a run labelled with the requested size is worse than
+# unlabelled, because it looks correct while making runs incomparable.
 runtime_info = {"backend": "pytorch", "weights": MODEL_WEIGHTS,
-                "imgsz": DEFAULT_IMGSZ, "int8": False, "torch_threads": None,
+                "imgsz": DEFAULT_IMGSZ, "effective_imgsz": None,
+                "int8": False, "torch_threads": None,
                 "workers": 1, "infer_threads": None}
 
 inflight = 0  # number of requests being processed
@@ -569,7 +577,17 @@ def detect():
         # lets a sweep be reconstructed from the edge CSV alone
         "worker_id": worker.idx,
         "infer_threads": runtime_info["infer_threads"],
-        "served_imgsz": runtime_info["imgsz"],     # resolution this frame really ran at
+        # The resolution the loaded artefact really runs at, not the one asked
+        # for - see runtime_info. Falls back to the request only when the model
+        # would not report its own input size.
+        "served_imgsz": runtime_info["effective_imgsz"] or runtime_info["imgsz"],
+        # The rest of the detection config, so an edge CSV is self-describing and
+        # two runs can be proven comparable from the results alone. Without these
+        # a server restarted with different weights or a different confidence
+        # floor produces results that look like a gating effect.
+        "served_weights": runtime_info["weights"],
+        "served_conf": CONF,
+        "served_int8": runtime_info["int8"],
     })
 
 
@@ -697,6 +715,10 @@ def main():
     # Confirm the artefact really runs at the requested resolution, so a bad
     # cache shows up here instead of invalidating a whole imgsz sweep silently.
     got = effective_imgsz(pool[0].model)
+    # Recorded, not just printed: this is the number the edge CSV needs. A warning
+    # on a terminal that has since scrolled away cannot tell you, weeks later,
+    # which resolution produced a given results file.
+    runtime_info["effective_imgsz"] = got[0] if got else None
     if got and got[0] != args.imgsz:
         print(f"[server] WARNING: asked for imgsz={args.imgsz}, loaded model runs at "
               f"{got[0]}x{got[1]}. Delete {export_path(args.weights, args.backend, args.imgsz, args.int8)} "
