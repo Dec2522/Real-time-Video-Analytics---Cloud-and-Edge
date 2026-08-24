@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 import math
+import queue
 import threading
 import time
 from collections import deque
@@ -28,8 +29,15 @@ DIFF_K = 3.0             # how many standard deviations away from mean single a 
 # nothing to recalibrate when the scene changes.
 DEFAULT_DIFF_BUDGET = 30.0   # summed frame_diff that must accrue before inferring
                              # (set per-video from offline profiling of frame_diff)
-DEFAULT_MAX_SKIP = 30        # safety floor: never skip more than this many
-                             # consecutive frames, whatever the budget says
+DEFAULT_MAX_SKIP = 90        # safety floor: never skip more than this many
+                             # consecutive frames, whatever the budget says.
+                             # Was 30, which at 25fps caps any skip at 1.2s - short
+                             # enough that on quiet footage the floor, not the
+                             # budget, decided almost every inference. Measured on
+                             # clip4_5_cropped_25.mp4 over a 10s near-static window:
+                             # every motion config skipped exactly 31 frames at a
+                             # time, i.e. the gate was inert and this line was the
+                             # whole policy. 90 is 3.6s at 25fps.
 
 PUSH_EVERY = 15          # metric push cadence
 
@@ -51,12 +59,51 @@ DEFAULT_FRAME_GAP = 5
 # can be stated: infer before any box has drifted more than this fraction of the
 # frame width. Requires box centres, so it only works against a cloud that
 # returns them.
-# The budget accumulates the FASTEST box's drift, not the mean. Association is
-# per object: a track is lost once its own predicted box stops overlapping its
-# detection, so one fast vehicle breaks while the rest of the scene is still
-# tracked fine. Gating on the mean hides exactly the object that fails first.
+# Which per-frame drift statistic the budget spends.
+#
+# 'max' is the principled choice: association is per object, so a track is lost
+# once its OWN predicted box stops overlapping its detection. One fast vehicle
+# breaks while the rest of the scene tracks fine, and the mean hides exactly the
+# object that fails first.
+#
+# It does not survive contact with quiet footage. The max is whichever single
+# box jitters most, and detector jitter does not fall when the scene stops
+# moving. Measured on clip4_5_cropped_25.mp4, comparing a near-static 10s window
+# against a 3.2x busier one:
+#
+#     signal                busy      still    ratio
+#     disp_rate    (mean)   0.00141   0.00076   1.86
+#     disp_rate_max (max)   0.00253   0.00178   1.42
+#     frame_diff            0.51      0.22      2.32
+#
+# The peak was identical in both windows (0.0365 vs 0.0363) - a noise floor, not
+# a measurement. Since disp_accum integrates it every frame, the static window
+# still accrued 0.86 of budget per 10s from jitter alone.
+#
+# That predicts the mean should gate better. It does not. Scored against an
+# ungated run on the same 640 frames, at matched inference counts:
+#
+#     signal  budget  infers  recall  vehicles seen
+#     mean    0.010      68    0.848      5/13
+#     max     0.030      24    0.802      7/13
+#     (fixed gap 9)      72    0.934      9/13
+#
+# So the better-discriminating statistic loses vehicles faster, and BOTH lose to
+# a fixed gap. The statistic is not the bottleneck: disp_rate_* can only be
+# measured from tracks that SURVIVED association, and gating is what breaks
+# association for the fastest objects - so the gate censors the signal it steers
+# by (the same flaw written up under the 'flow' gate below, which exists to
+# escape it). Choosing between mean and max is rearranging deck chairs on a
+# censored measurement. 'max' stays the default because it empirically keeps
+# more vehicles; the flag exists so the comparison can be rerun, not because
+# either value is good.
+MOTION_SIGNALS = ("mean", "max")
+DEFAULT_MOTION_SIGNAL = "max"
 # Scale: at IoU 0.5 two same-size boxes can be offset by about a third of a box
 # width, and vehicles here are roughly 0.09 wide normalised - hence 0.03.
+# NOTE: budgets do not transfer between signals - the mean runs roughly 0.55x
+# the max on this footage - nor between videos. Re-profile per clip: on
+# clip4_5_cropped_25.mp4 this 0.03 default sits far past the useful range.
 DEFAULT_MOTION_BUDGET = 0.03   # normalised frame widths of drift to allow
 MOTION_ALPHA = 0.2             # EWMA weight on the measured displacement rate
 
@@ -95,7 +142,23 @@ MOTION_ALPHA = 0.2             # EWMA weight on the measured displacement rate
 # prevent. 0.5 keeps the worst frame at 13ms for 0.07 of correlation.
 FLOW_SCALE = 0.5           # downscale before flow. Magnitudes are normalised, so
                            # this buys ~4x the speed without changing the unit
-FLOW_MAX_FEATURES = 240
+# Feature density. 240 was right while the field only had to produce one scalar
+# per frame for the gate - a scalar is well estimated from a sparse set. Once the
+# field also WARPS boxes (see below) the requirement changes: each box needs
+# FLOW_WARP_MIN_FEATURES of its own, and a small distant vehicle at 240 corners
+# over 1080p usually has none. That is a per-box failure a frame-level p95 cannot
+# show. Measured over 400 frames at scale 0.5, gap 20, warp coverage = fraction
+# of carried boxes with enough features to move:
+#   maxCorners 240  minDistance 8 -> 2.5 ms/frame  coverage 49%
+#   maxCorners 480  minDistance 6 -> 3.0 ms/frame  coverage 68%
+#   maxCorners 800  minDistance 4 -> 3.2 ms/frame  coverage 80%
+#   maxCorners 1200 minDistance 3 -> 3.8 ms/frame  coverage 84%
+# and what that coverage buys, as carried-frame recall against an ungated run:
+#   gap 12: freeze 0.631 | warp@240 0.785 | warp@800 0.883
+#   gap 20: freeze 0.465 | warp@240 0.668 | warp@800 0.824
+# 800 costs 0.7ms over 240 and converts half the remaining loss. 1200 buys 4
+# points of coverage for another 0.6ms and no recall, so the knee is at 800.
+FLOW_MAX_FEATURES = 800
 # Re-detect corners every N frames: features riding on vehicles leave the frame
 # and are permanently lost. goodFeaturesToTrack costs ~4x a tracking step, so
 # this interval sets the latency spike RATE - at 15 the p95 nearly doubles (11.5ms
@@ -103,7 +166,12 @@ FLOW_MAX_FEATURES = 240
 # FLOW_MIN_FEATURES floor below is what actually handles attrition. 30 frames is
 # one second at 30fps, and only guards against slow drift in what survives.
 FLOW_REFRESH = 30
-FLOW_MIN_FEATURES = 40     # re-detect early once this few survive
+FLOW_MIN_FEATURES = 300    # re-detect early once this few survive. Scaled with
+                           # FLOW_MAX_FEATURES so it keeps its meaning ("the set
+                           # has lost most of itself"); measured free on this
+                           # footage, where attrition never reaches it inside one
+                           # refresh interval, and it is there for the scene where
+                           # it does
 FLOW_MOVING_MIN = 0.0005   # per-frame magnitude above which a feature counts as
                            # moving. The camera is static, so most features sit
                            # on road and buildings; without this split the
@@ -111,8 +179,99 @@ FLOW_MOVING_MIN = 0.0005   # per-frame magnitude above which a feature counts as
 FLOW_ERR_MAX = 20.0        # LK tracking error above which a match is discarded
 FLOW_ALPHA = 0.2           # EWMA weight, for comparison with disp_rate_max_ewma
 
+# --- global-motion rejection ---
+# With a static camera most features sit on road, kerb and buildings, so the
+# MEDIAN displacement vector over all features is the motion of the scene as a
+# whole: shake, a pan, or the residual jitter of a "fixed" pole mount. Subtract
+# it and what is left is object motion. Without it a two-pixel shake reads as
+# every feature in the frame moving at once - the exact signature the gate is
+# built to fire on - so the gate spends its budget on wind. Applied to the GATE
+# statistics only: box warping below deliberately uses the RAW field, because
+# after the camera moves a box really is somewhere else in the image.
+FLOW_GLOBAL_REJECT = True
+
+# --- carried-box warping ---
+# A gated frame serves the previous inference's boxes. Freezing them in place is
+# what makes gating expensive: a box the vehicle has left is wrong twice over -
+# it misses the vehicle (recall) and reports one where there is none (precision)
+# - so the only way to stay accurate is to keep the boxes fresh, i.e. to never
+# really skip. That is why an adaptive budget of 0.03 against a true drift of
+# 0.0158/frame converges on firing every ~1.9 frames: the machinery is adaptive
+# but the thing it is protecting cannot survive a gap.
+# Translating each carried box by the median flow of the features inside it
+# breaks that link. The gate then only has to fire when the flow field stops
+# describing the box - a turn, an occlusion, a new arrival - rather than every
+# time anything moves at all. The field is already computed for the gate, so
+# this costs one median per box per frame.
+# Median, not mean: a box straddling a vehicle and the road behind it holds
+# features from two populations, and their mean is a speed nothing in the frame
+# is actually travelling at.
+FLOW_WARP_MIN_FEATURES = 3   # below this a box has no reliable local field of
+                             # its own, so it is left where it is rather than
+                             # dragged by two corners of noise
+
+# What it is worth, and what it does to the budget. Simulated over the 935-frame
+# ungated reference (its own detections replayed through the gate, so
+# inferred_recall is 1.0 by construction and only the CARRIED columns are the
+# measurement), scored with track_eval.py:
+#   flow budget   inferred    carried recall        carried centre err
+#                 /935      freeze -> warp        freeze -> warp
+#   0.0246 (dflt)   343      0.935 -> 0.946        0.0051 -> 0.0014
+#   0.05            192      0.846 -> 0.930        0.0070 -> 0.0019
+#   0.10            104              0.888                  0.0027
+#   0.20             56              0.811                  0.0032
+# Read it as: warping roughly doubles the budget that holds a given accuracy.
+# Warped at 0.10 serves 104 inferences at 0.888 carried recall; frozen needs 192
+# to reach 0.846. Note also that the DEFAULT budget of 0.03 (0.0246 in flow
+# units) fires 343 times in 935 frames - a gap of 2.7 - which is the "adaptive
+# machinery converging on every other frame" that made the whole gate pointless.
+# The budget is what to sweep now; 0.05-0.20 is where the interesting trade is,
+# not 0.03.
+# The centre error is flat from 0.10 onwards, which says the residual is the ~18%
+# of boxes with too few features to warp, not accumulated warp drift.
+#
+# Confirmed live on clip4_5_cropped_25.mp4 (640 frames, scored against an ungated
+# run, not replayed). This is the first gate here that beats a fixed gap:
+#
+#   config                infers  recall  vehicles seen  lag max
+#   fixed gap 6              107   0.949      10/13        240ms
+#   flow moving_p95 0.05      38   0.946      10/13        390ms
+#   flow p95 0.02             66   0.948      11/13       1021ms
+#   motion max 0.03           24   0.802       7/13        287ms
+#
+# flow at 0.05 matches a fixed gap of 6 on both recall and vehicles seen for a
+# THIRD of the inference. The reason is visible in the signal itself: over a 10s
+# near-static window vs a 3.2x busier one, flow_p95 separated them 13.0x and
+# flow_moving_p95 3.7x, where disp_rate_max_ewma managed 1.50x. Track drift
+# cannot see stillness because it is measured off surviving tracks; flow can.
+# Budgets do NOT carry over from the numbers above - those are traffic.mp4 at
+# 1920x1080. On this clip the useful range is 0.02-0.05, and 0.10 already
+# collapses coverage to 54%. Re-profile per clip.
+
+# flow_moving_p95 and disp_rate_max ask the same question in the same unit but
+# do not agree numerically: disp_rate_max is the single fastest BOX, flow is the
+# 95th percentile of moving FEATURES, and flow runs on a downscaled frame. The
+# ratio has to be measured, and --flow-budget defaults to it x --motion-budget so
+# the two gates allow the same real staleness. Spending one --motion-budget on
+# both units made every 'flow' run ~20% tighter than the 'motion' run it was
+# compared against - a fifth of the effect the sweep was trying to measure.
+#
+# 0.82, not the 0.79 in the scale table above: that figure came from the first
+# 400 frames, this one from all 935 frames of the ungated reference run
+# (ref.csv), mean flow_moving_p95 0.01190 over mean disp_rate_max 0.01446.
+# Neither global-motion rejection nor the denser feature set moves it (0.819 ->
+# 0.823), which is the expected result on a static camera: the median vector is
+# already ~0, so there is nothing for the rejection to remove, and a percentile
+# is insensitive to how many features it is taken over.
+# Re-measure it for other footage - it is a property of the scene, not of the
+# code. A panning camera is exactly where it will change.
+FLOW_TO_MOTION_RATIO = 0.82
+
 FEATURE_PARAMS = dict(maxCorners=FLOW_MAX_FEATURES, qualityLevel=0.05,
-                      minDistance=8, blockSize=7)
+                      # 4, not 8: minDistance is what actually decides whether a
+                      # small box can hold three features. Raising maxCorners
+                      # without lowering this just spreads the same count wider.
+                      minDistance=4, blockSize=7)
 LK_PARAMS = dict(winSize=(21, 21), maxLevel=3,
                  criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
 
@@ -162,7 +321,13 @@ DEFAULT_JPEG_QUALITY = 80
 CSV_HEADER = [
     "stream_id", "frame", "ts", "storage_io_ms", "preprocess_ms", "round_trip_ms",
     "decode_ms", "inference_ms", "queue_wait_ms", "network_ms", "end_to_end_ms",
-    "throughput_fps", "objects_in_frame", "unique_total",
+    "throughput_fps", "objects_in_frame",
+    # Bookkeeping only - NOT an accuracy metric, and not comparable between gate
+    # settings. It moves in both directions at once: an ID switch inflates it, a
+    # missed vehicle deflates it, so a gate that fragments every track can report
+    # the same total as a perfect one. Accuracy comes from track_eval.py scoring
+    # a --tracks-out dump against an UNGATED dump of the same frames.
+    "unique_total",
     "edge_cpu", "edge_mem", "payload_kb", "bandwidth_mbps",
     "frame_diff", "content_shift_detected",
     # summed frame_diff since the last inference, as it stood when this frame was
@@ -174,7 +339,11 @@ CSV_HEADER = [
     # real "can the edge keep up?" signal once the loop is paced
     "pacing_lag_ms",
     # --- frame gating ---
-    "gate_mode", "inference_ran", "filter_rate",
+    # request_failed marks a frame that WAS selected for inference but got no
+    # answer. It is then served carried-forward exactly like a gated frame, so
+    # inference_ran is False for it; without this column a dropped request is
+    # indistinguishable from a skip the gate chose to make.
+    "gate_mode", "inference_ran", "request_failed", "filter_rate",
     # cloud runtime that served this run, so backend comparisons are self-labelling
     "backend",
     # --- cloud concurrency config, reported per response ---
@@ -214,6 +383,12 @@ CSV_HEADER = [
     # which flow statistic the 'flow' gate is spending, its EWMA, and the total
     # accrued since the last inference as it stood when this frame was gated
     "flow_signal", "flow_ewma", "flow_accum",
+    # --- carried-box warping ---
+    # How many carried boxes this frame's flow field was dense enough to move,
+    # and the mean distance it moved them (frame widths). warp_boxes well below
+    # box_count means the field is too sparse for the small boxes - the first
+    # thing to check when carried_recall does not improve.
+    "warp_boxes", "warp_shift",
 ]
 
 # Instead of sampling CPU metrics per instance, sampling is done periodically
@@ -319,6 +494,12 @@ class FlowMeter:
         self.prev = None
         self.points = None
         self.since_detect = 0
+        # This frame's RAW displacement field in box coordinates: (positions,
+        # deltas), both normalised x/width and y/height to match the xywhn
+        # convention cx/cy already use, so warp() can add deltas straight onto a
+        # box centre. Cleared at the top of every update, so a frame where flow
+        # failed warps nothing instead of re-applying the last field.
+        self.field = None
 
     def _detect(self, small):
         """Re-seed the feature set. Returns nothing; points may end up None."""
@@ -326,6 +507,7 @@ class FlowMeter:
         self.since_detect = 0
 
     def update(self, gray):
+        self.field = None
         small = (cv2.resize(gray, None, fx=self.scale, fy=self.scale,
                             interpolation=cv2.INTER_AREA)
                  if self.scale != 1.0 else gray)
@@ -350,6 +532,16 @@ class FlowMeter:
             old_pts = self.points.reshape(-1, 2)[keep]
             if len(new_pts):
                 delta = new_pts - old_pts
+                # Field for warping, in box coordinates: x by width, y by height,
+                # the convention cx/cy are in. Kept RAW - a pan moves every box
+                # in the image and warp() has to follow it.
+                scale_xy = np.array([small.shape[1], small.shape[0]], dtype=float)
+                self.field = (old_pts / scale_xy, delta / scale_xy)
+                # Gate statistics, in motion coordinates. Subtract the median
+                # vector first: with a truly static camera it is ~0 and this
+                # changes nothing, and when the camera moves it IS that movement.
+                if FLOW_GLOBAL_REJECT:
+                    delta = delta - np.median(delta, axis=0)
                 # Both axes over WIDTH: mixing width and height normalisation
                 # would make the unit depend on the aspect ratio.
                 mag = np.hypot(delta[:, 0], delta[:, 1]) / small.shape[1]
@@ -367,6 +559,45 @@ class FlowMeter:
                 or self.since_detect >= self.refresh):
             self._detect(small)
         return stats
+
+    def warp(self, dets):
+        """Advance carried-forward boxes by one frame of measured flow.
+
+        Each box moves by the MEDIAN displacement of the features that were
+        inside it, so a box holding features from both a vehicle and the road
+        behind it follows the majority rather than their average. A box with
+        fewer than FLOW_WARP_MIN_FEATURES of its own is left where it is - the
+        old freeze behaviour, but now only for the boxes that have no evidence.
+
+        Returns (boxes, warped_count, mean_shift). Boxes are fresh dicts: the
+        caller's last inference set is the baseline the NEXT inference measures
+        displacement against, and must stay exactly as it was detected.
+
+        A box whose centre leaves the frame is dropped rather than clamped. The
+        vehicle has gone, and holding it against the edge would report a phantom
+        for as long as the gate coasts - a precision loss with no upside.
+        """
+        if self.field is None or not dets:
+            return [dict(d) for d in (dets or [])], 0, None
+
+        pts, delta = self.field
+        out, warped, shift_sum = [], 0, 0.0
+        for d in dets:
+            box = dict(d)
+            if "cx" not in d or "w" not in d:
+                out.append(box)
+                continue
+            inside = ((np.abs(pts[:, 0] - d["cx"]) <= d["w"] / 2)
+                      & (np.abs(pts[:, 1] - d["cy"]) <= d["h"] / 2))
+            if int(inside.sum()) >= FLOW_WARP_MIN_FEATURES:
+                dx, dy = np.median(delta[inside], axis=0)
+                box["cx"] = float(d["cx"] + dx)
+                box["cy"] = float(d["cy"] + dy)
+                warped += 1
+                shift_sum += float(math.hypot(dx, dy))
+            if 0.0 <= box["cx"] <= 1.0 and 0.0 <= box["cy"] <= 1.0:
+                out.append(box)
+        return out, warped, (shift_sum / warped if warped else None)
 
     @staticmethod
     def _summarise(mag):
@@ -409,14 +640,24 @@ def classify_density(value, state, lo, hi, margin):
 def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_FRAME_GAP,
                realtime=True, encoding="png", width=None, jpeg_quality=DEFAULT_JPEG_QUALITY,
                diff_budget=DEFAULT_DIFF_BUDGET, max_skip=DEFAULT_MAX_SKIP,
-               motion_budget=DEFAULT_MOTION_BUDGET, density_metric=DEFAULT_DENSITY_METRIC,
+               motion_budget=DEFAULT_MOTION_BUDGET,
+               motion_signal=DEFAULT_MOTION_SIGNAL,
+               density_metric=DEFAULT_DENSITY_METRIC,
                density_lo=DEFAULT_DENSITY_LO, density_hi=DEFAULT_DENSITY_HI,
                flow_signal=DEFAULT_FLOW_SIGNAL, flow_scale=FLOW_SCALE, use_flow=True,
+               flow_budget=None, warp_carried=True,
                tracks_out=None, max_frames=None):
     """Process a single video stream, sending frames to the cloud for inference, and logging metrics."""
 
     detect_url = f"{host}/detect"
     metrics_url = f"{host}/metrics"
+
+    # Flow is measured in a different unit from track displacement, so it gets
+    # its own budget rather than borrowing --motion-budget (see
+    # FLOW_TO_MOTION_RATIO). Default converts, so an unspecified --flow-budget
+    # still means "the same staleness --motion-budget asks for".
+    if flow_budget is None:
+        flow_budget = motion_budget * FLOW_TO_MOTION_RATIO
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -465,10 +706,17 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
     skipped_since_infer = 0
     budget_floor_hits = 0      # inferences forced by MAX_SKIP rather than the budget
 
-    # Cache last detections so they're reused for frames not sent to the cloud
+    # Cache last detections so they're reused for frames not sent to the cloud.
+    # last_dets holds them exactly as DETECTED - it is the baseline the next
+    # inference measures displacement against, so it must not be warped.
+    # carried_dets is the working copy served on gated frames, advanced one frame
+    # of flow at a time, and reset to None by every successful inference.
     last_dets = None
+    carried_dets = None
     frames_inferred = 0
     frames_skipped = 0
+    frames_failed = 0          # selected for inference but the request dropped
+    failure_logged = False     # only print the exception text once per stream
     frames_late = 0            # frames that finished after their scheduled slot
     max_lag_ms = 0.0
     backend = None            # reported by the cloud on each /detect response
@@ -525,6 +773,58 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
     tracks_file = None
     if tracks_out:
         tracks_file = open(f"{tracks_out}_stream{stream_id}.jsonl", "w")
+
+    # --- off-loop I/O ---
+    # The CSV flush, the JSONL flush, the metrics POST and the terminal print all
+    # used to happen between finishing a frame and sleeping until the next one -
+    # i.e. inside the pacing window, adding to the very pacing_lag_ms used to
+    # judge whether the edge can service the feed in real time. A flush is a
+    # syscall, a POST is a network round trip and a Windows console write is
+    # neither cheap nor bounded; measuring the loop with them inside it measures
+    # the logger.
+    #
+    # Measured, 300 frames paced at 30fps against a local stub cloud:
+    #   flushes + local POST   inline 23.0ms mean lag -> off-loop 22.1ms
+    #   with a 60ms /metrics   inline 31.0ms mean, p95 87.5 -> off-loop 24.5, p95 56.8
+    #                          and on the frame after a push: 85.9ms -> 30.8ms
+    # So the flushes alone are worth about 1ms a frame, and the honest headline is
+    # the second row: the dashboard POST is remote in the real deployment
+    # (CLOUD_HOST is another host), and inline it was charging one frame in
+    # PUSH_EVERY the entire round trip. That is a spike in p95 and max, not in the
+    # mean, which is exactly the shape of number a real-time claim rests on.
+    #
+    # They move to one consumer thread per stream, which keeps
+    # per-row flushing (these threads are daemons, so Ctrl-C loses anything
+    # buffered) at no cost to the loop. The queue is unbounded on purpose:
+    # dropping a metrics row to protect the loop would corrupt the results the
+    # loop exists to produce, and the writer only ever trails by its own latency.
+    sink_q = queue.Queue()
+
+    def sink():
+        # Its own session: requests.Session is not documented thread-safe, and
+        # the loop is using the other one for /detect.
+        push_session = requests.Session()
+        while True:
+            item = sink_q.get()
+            if item is None:
+                break
+            row, track_line, push, status = item
+            if status is not None:
+                with print_lock:
+                    print(status)
+            if track_line is not None and tracks_file is not None:
+                tracks_file.write(track_line)
+                tracks_file.flush()
+            writer.writerow(row)
+            csv_file.flush()
+            if push is not None:
+                try:
+                    push_session.post(metrics_url, json=push, timeout=2)
+                except requests.RequestException:
+                    pass
+
+    sink_thread = threading.Thread(target=sink, name=f"sink-{stream_id}", daemon=True)
+    sink_thread.start()
 
     while cap.isOpened():
         # Checked before the read, so the count is exact and no frame is decoded
@@ -584,10 +884,14 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
         # carries the change that actually triggered it.
         change_since_infer = diff_accum
 
-        # Predicted drift of the fastest box since the last inference. Unlike
-        # diff_accum this is a forecast, not a measurement - a gated frame has no
-        # fresh boxes to measure from, so the last known rate is extrapolated.
-        disp_accum += disp_rate_max_ewma or 0.0
+        # Predicted drift since the last inference, from whichever statistic the
+        # gate is set to spend (see MOTION_SIGNALS). Unlike diff_accum this is a
+        # forecast, not a measurement - a gated frame has no fresh boxes to
+        # measure from, so the last known rate is extrapolated. Both EWMAs are
+        # always maintained and logged; only the spent one is selected here.
+        motion_rate_ewma = (disp_rate_max_ewma if motion_signal == "max"
+                            else disp_rate_ewma)
+        disp_accum += motion_rate_ewma or 0.0
         motion_since_infer = disp_accum
 
         # Flow accrued since the last inference. Snapshotted before the gate can
@@ -597,6 +901,9 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
 
         # Decide whether to run inference on this frame based on gating mode defined
         forced_by_floor = False
+        request_failed = False
+        warp_boxes = 0
+        warp_shift = None
         if last_dets is None or gate_mode == "none":
             # last_dets is None covers the first frame of the stream (and any frame
             # after a failed request): a stream always starts with an inference.
@@ -611,7 +918,7 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
             run_inference = diff_accum >= diff_budget or forced_by_floor
         elif gate_mode == "motion":
             forced_by_floor = skipped_since_infer >= max_skip
-            if disp_rate_max_ewma is None:
+            if motion_rate_ewma is None:
                 # No rate yet: it takes two inferred frames sharing a track for
                 # one to exist, so infer back to back until they do - but only
                 # while there is a track to wait for. With nothing detected there
@@ -629,7 +936,18 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
             # the second frame and needs neither a detection nor a track, so
             # there is nothing to wait for and nothing to warm up.
             forced_by_floor = skipped_since_infer >= max_skip
-            run_inference = flow_accum >= motion_budget or forced_by_floor
+            # flow_accum already includes this frame's motion, and this frame is
+            # about to be inferred, so it is served fresh - the drift that was
+            # actually SERVED stale is the previous frame's total, which was below
+            # budget. The contract therefore already holds exactly, and the
+            # flow_accum logged on an inferred row necessarily exceeds the budget
+            # by construction (it is the value that tripped it). Do not "fix"
+            # that gap by firing a frame early: it just tightens the budget by
+            # one frame's flow, which --flow-budget expresses more clearly.
+            # Spends flow_budget, not motion_budget: the units differ by ~0.79
+            # (see FLOW_TO_MOTION_RATIO), so sharing one number silently gave
+            # this gate a tighter budget than the 'motion' gate it is compared to.
+            run_inference = flow_accum >= flow_budget or forced_by_floor
         else:  # adaptive
             run_inference = content_shift_detected
 
@@ -681,10 +999,34 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
                                   f"low_conf_frac against {CLOUD_CONF_FLOOR}. Update "
                                   f"CLOUD_CONF_FLOOR to compare against earlier runs.")
             except requests.RequestException as e:
-                with print_lock:
-                    print(f"[stream {stream_id}] Request failed: {e}")
-                continue
+                # Deliberately NOT a `continue`. That did two things:
+                #  - skipped the CSV row, so the drop left no trace at all. The
+                #    frame counter still advanced, so the run reported N frames
+                #    processed when some of them were never served.
+                #  - skipped the pacing sleep at the bottom of the loop. A fast
+                #    failure (connection refused returns in milliseconds) then let
+                #    the loop decode the next frame immediately, and a run of them
+                #    consumed the video at decode speed while pacing_lag_ms sat
+                #    near zero - the loop was no longer simulating a live feed at
+                #    all, and the metric that should have said so read fine.
+                # The frame is served like a gated one instead: carried boxes, a
+                # row of its own, and the accumulators left intact so the next
+                # frame retries immediately.
+                request_failed = True
+                frames_failed += 1
+                # The wait really happened and is the reason this frame is late,
+                # so it is kept rather than nulled. rt0 is set before the post.
+                round_trip_ms = (time.time() - rt0) * 1000
+                # Printed once. Every later drop shows as REQUEST FAILED in the
+                # per-frame line and as request_failed in the CSV, and a console
+                # write per failed frame is itself time inside the pacing window.
+                if not failure_logged:
+                    failure_logged = True
+                    with print_lock:
+                        print(f"[stream {stream_id}] Request failed ({e}). Further "
+                              f"drops are reported per frame and in request_failed.")
 
+        if run_inference and not request_failed:
             # Displacement needs the previous inferred frame, so it is measured
             # before last_dets is replaced.
             if last_infer_frame is not None:
@@ -720,6 +1062,10 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
                 density_state_since = frame_num
 
             last_dets = dets
+            # Drop the warped working copy: the next gated frame re-seeds it from
+            # these fresh boxes, so warp error never accumulates across an
+            # inference.
+            carried_dets = None
             last_infer_frame = frame_num
             frames_inferred += 1
             # Spend the accumulated change only once the frame has actually been
@@ -734,8 +1080,14 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
             # network time = round trip minus cloud-side decode + inference + lock wait
             network_ms = round_trip_ms - decode_ms - inference_ms - queue_wait_ms
 
-            # end-to-end latency: disk read, encode, cloud response
-            end_to_end_ms = storage_io_ms + preprocess_ms + round_trip_ms
+            # End-to-end latency: disk read, edge analysis, encode, cloud round
+            # trip. shift_ms is included HERE as well as on gated frames because
+            # it is paid on every decoded frame - frame diff and optical flow run
+            # before the gate. Leaving it out reported the ungated baseline as
+            # having no edge-analysis cost at all while every gated run paid it in
+            # full, so the baseline was flattered by exactly the term that makes
+            # gating look expensive.
+            end_to_end_ms = shift_ms + storage_io_ms + preprocess_ms + round_trip_ms
 
             # Mbps - bits / time (s) / 1e6 for megabits
             bandwidth_mbps = (len(buf) * 8 / (network_ms / 1000) / 1e6) if network_ms > 0 else 0
@@ -746,19 +1098,44 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
                 with print_lock:
                     print(f">>> [stream {stream_id}] Time to first frame: {ttff_ms:.0f}ms")
         else:
-            # No inference, reuse last detections
-            dets = last_dets
-            frames_skipped += 1
+            # No fresh detections for this frame - either the gate skipped it, or
+            # the request for it failed. Both serve carried-forward boxes and both
+            # are 'carried' frames to the scorer; the difference is that a failure
+            # already paid for the encode and the wait, and those costs are kept
+            # rather than nulled because they are why the frame was late.
+            #
+            # The boxes are not served frozen. Each gated frame advances them by
+            # one frame of MEASURED flow, so a skip run degrades at the rate the
+            # flow field is wrong by, not at the rate the traffic moves. This is
+            # what lets a budget buy a real gap: a frozen box at 0.0158 drift per
+            # frame exhausts a 0.03 budget in under two frames, which is how the
+            # adaptive gate ended up behaving like 'fixed' with a gap of 2.
+            if carried_dets is None:
+                carried_dets = [dict(d) for d in (last_dets or [])]
+            if warp_carried and flow_meter is not None:
+                carried_dets, warp_boxes, warp_shift = flow_meter.warp(carried_dets)
+            dets = carried_dets
             skipped_since_infer += 1
-            preprocess_ms = None
-            payload_kb = None
-            round_trip_ms = None
+            if request_failed:
+                # preprocess_ms, payload_kb and round_trip_ms hold this frame's
+                # real measurements; leave them. Not counted as skipped either -
+                # filter_rate answers "what did the gate keep from the model",
+                # and a dropped request is not a gating decision.
+                pass
+            else:
+                frames_skipped += 1
+                preprocess_ms = None
+                payload_kb = None
+                round_trip_ms = None
             decode_ms = None
             inference_ms = None
             queue_wait_ms = None
             network_ms = None
-            end_to_end_ms = shift_ms + storage_io_ms  # only disk read + content shift detection
             bandwidth_mbps = None
+            # Disk read + edge analysis, plus the encode and the dropped wait on
+            # a failed frame. Both terms are None on a genuinely gated frame.
+            end_to_end_ms = (shift_ms + storage_io_ms
+                             + (preprocess_ms or 0.0) + (round_trip_ms or 0.0))
 
         # frames completed per second so far
         throughput_fps = frame_num / (time.time() - wall_start)
@@ -813,14 +1190,20 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
             # change accrued since the previous inference (pre-reset), so the
             # budget can be profiled offline from any run, whatever the gate mode
             "change_since_infer": round(change_since_infer, 2),
-            "ttff_ms": round(ttff_ms, 1) if frame_num == 1 else None,
+            # rnd(), not round(): frame 1's request can fail, and then there is
+            # no first frame to have timed yet. Only reachable now that a failed
+            # request writes its row instead of skipping the loop body.
+            "ttff_ms": rnd(ttff_ms, 1) if frame_num == 1 else None,
             "pacing_lag_ms": rnd(pacing_lag_ms, 1),
             # fps the loop is pacing to, so the dashboard can show achieved
             # rate against the target instead of a bare throughput number
             "target_fps": round(src_fps, 2) if frame_interval else None,
-            # frame gating
+            # frame gating. inference_ran is what the frame was actually SERVED
+            # from, not what the gate wanted: a frame whose request dropped is
+            # served carried-forward, so it reads False and request_failed True.
             "gate_mode": gate_mode,
-            "inference_ran": run_inference,
+            "inference_ran": run_inference and not request_failed,
+            "request_failed": request_failed,
             # fraction of decoded frames that never reached the model so far
             "filter_rate": round(frames_skipped / frame_num, 3),
             "backend": backend,
@@ -861,6 +1244,10 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
             "flow_signal": flow_signal if flow_meter is not None else None,
             "flow_ewma": rnd(flow_ewma, 6),
             "flow_accum": round(flow_since_infer, 6),
+            # carried-box warping - 0/None on an inferred frame, since fresh
+            # boxes have nothing to warp forward
+            "warp_boxes": warp_boxes,
+            "warp_shift": rnd(warp_shift, 6),
         }
 
         # Print to terminal. IDs in the frame are listed, not just counted, so a
@@ -873,36 +1260,33 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
             accrued = f"flow since infer: {flow_since_infer:.3f}"
         else:
             accrued = f"change since infer: {change_since_infer:.1f}"
-        with print_lock:
-            state = "**Inferred**" + (" [floor]" if forced_by_floor else "") if run_inference else "Not inferred"
-            print(f"Stream: {stream_id} Frame:{frame_num} | {state} | End-to-End: {end_to_end_ms:.0f}ms "
-                  f"| {throughput_fps:.1f} FPS | {accrued} | density: {density_state} "
-                  f"| IDs: [{ids_desc}] | Unique objects: {len(seen_ids)}")
+        if request_failed:
+            state = "REQUEST FAILED"
+        elif run_inference:
+            state = "**Inferred**" + (" [floor]" if forced_by_floor else "")
+        else:
+            state = "Not inferred" + (f" [warp {warp_boxes}]" if warp_boxes else "")
+        status_line = (f"Stream: {stream_id} Frame:{frame_num} | {state} | "
+                       f"End-to-End: {end_to_end_ms:.0f}ms "
+                       f"| {throughput_fps:.1f} FPS | {accrued} | density: {density_state} "
+                       f"| IDs: [{ids_desc}] | ids seen: {len(seen_ids)}")
 
-        # Per-frame track dump. `inferred` is what lets the scorer separate the
-        # accuracy of a fresh inference from the accuracy of stale carried-forward
-        # state - two different failures that objects_in_frame blends into one.
-        if tracks_file is not None:
-            tracks_file.write(json.dumps({
+        # Hand the frame's I/O to the sink thread and get straight to the pacing
+        # sleep. Everything below this point used to run inside the pacing window.
+        # The track dump's `inferred` flag is what lets the scorer separate the
+        # accuracy of a fresh inference from the accuracy of carried-forward state
+        # - two different failures that objects_in_frame blends into one - so it
+        # follows inference_ran, not the gate's intent.
+        sink_q.put((
+            [record[k] for k in CSV_HEADER],
+            (json.dumps({
                 "frame": frame_num,
-                "inferred": bool(run_inference),
+                "inferred": bool(run_inference and not request_failed),
                 "dets": dets or [],
-            }) + "\n")
-            tracks_file.flush()   # daemon thread; same reason the CSV flushes
-
-        #  CSV log
-        writer.writerow([record[k] for k in CSV_HEADER])
-        # Flushed every row: these threads are daemons, so Ctrl-C kills the
-        # process without closing the file and anything still buffered is lost.
-        # Same reason the cloud metrics CSV flushes per row.
-        csv_file.flush()
-
-        # push metrics to cloud dashboard every N frames - regardless of gate mode
-        if frame_num % PUSH_EVERY == 0:
-            try:
-                session.post(metrics_url, json=record, timeout=2)
-            except requests.RequestException:
-                pass
+            }) + "\n") if tracks_file is not None else None,
+            record if frame_num % PUSH_EVERY == 0 else None,
+            status_line,
+        ))
 
         # If frame processing finishes early, wait for the next frames slot rather than racing ahead infront of real time.
         # Sleeping against an absolute deadline (rather than a fixed sleep per
@@ -915,6 +1299,11 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
                 time.sleep(wait)
 
     cap.release()
+    # Drain the sink before closing anything it writes to. The queue holds at
+    # most a frame or two of backlog, but a pending metrics POST can be sitting
+    # on its 2s timeout, hence the bounded join rather than a bare one.
+    sink_q.put(None)
+    sink_thread.join(timeout=15)
     csv_file.close()
     if tracks_file is not None:
         tracks_file.close()
@@ -925,18 +1314,30 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
         if gate_mode == "budget":
             gate_detail = f"budget={diff_budget:g} max_skip={max_skip} floor_hits={budget_floor_hits} "
         elif gate_mode == "motion":
+            spent_rate = (disp_rate_max_ewma if motion_signal == "max"
+                          else disp_rate_ewma)
             gate_detail = (f"motion_budget={motion_budget:g} max_skip={max_skip} "
-                           f"floor_hits={budget_floor_hits} "
-                           f"final_max_rate={disp_rate_max_ewma or 0:.4f} ")
+                           f"floor_hits={budget_floor_hits} signal={motion_signal} "
+                           f"final_rate={spent_rate or 0:.4f} ")
         elif gate_mode == "flow":
-            gate_detail = (f"motion_budget={motion_budget:g} max_skip={max_skip} "
+            gate_detail = (f"flow_budget={flow_budget:g} max_skip={max_skip} "
                            f"floor_hits={budget_floor_hits} signal={flow_signal} "
                            f"final_flow_rate={flow_ewma or 0:.4f} ")
         else:
             gate_detail = ""
-        print(f"stream {stream_id} COMPLETE: gate={gate_mode} {gate_detail}{pacing_desc}"
+        warp_desc = ("warp=on " if warp_carried and flow_meter is not None else "warp=off ")
+        # ids_seen is bookkeeping, not accuracy - see the CSV_HEADER note on
+        # unique_total. The accuracy of this run is whatever track_eval.py says
+        # about its dump next to an ungated one, and there is no way to state it
+        # from inside a single run.
+        print(f"stream {stream_id} COMPLETE: gate={gate_mode} {gate_detail}{warp_desc}{pacing_desc}"
               f"frames={frame_num} inferred={frames_inferred} skipped={frames_skipped} "
-              f"Unique Objects={len(seen_ids)}, Total time={time.time() - wall_start:.1f}s")
+              f"failed={frames_failed} ids_seen={len(seen_ids)}, "
+              f"Total time={time.time() - wall_start:.1f}s")
+        if gate_mode != "none" and not tracks_out:
+            print(f"stream {stream_id} NOTE: gated run with no --tracks-out, so it "
+                  f"cannot be scored. Re-run with --tracks-out and compare against "
+                  f"an ungated dump using track_eval.py.")
 
 
 def main():
@@ -974,17 +1375,47 @@ def main():
                              f"you are willing to let pass unseen, so e.g. the sum of "
                              f"frame_diff over the longest gap you can tolerate")
     parser.add_argument("--max-skip", type=int, default=DEFAULT_MAX_SKIP,
-                        help=f"'budget' and 'motion' gates: never skip more than this "
-                             f"many consecutive frames, whatever the budget says - bounds "
+                        help=f"'budget', 'motion' and 'flow' gates: never skip more than "
+                             f"this many consecutive frames, whatever the budget says - bounds "
                              f"the worst-case miss (default {DEFAULT_MAX_SKIP})")
     parser.add_argument("--motion-budget", type=float, default=DEFAULT_MOTION_BUDGET,
-                        help=f"'motion' gate only: infer once the FASTEST tracked box is "
-                             f"predicted to have drifted this far, as a fraction of frame "
-                             f"width (default {DEFAULT_MOTION_BUDGET:g}). Unlike --budget this "
-                             f"is directly interpretable - it is the staleness you allow the "
-                             f"worst-case object, and association fails at roughly a third of "
-                             f"a box width. Profile disp_rate_max_ewma on an ungated run and "
+                        help=f"'motion' gate only: infer once tracked boxes are predicted "
+                             f"to have drifted this far, as a fraction of frame "
+                             f"width (default {DEFAULT_MOTION_BUDGET:g}); --motion-signal picks "
+                             f"whether that is the fastest box or the mean. Unlike --budget this "
+                             f"is directly interpretable - it is the staleness you allow, "
+                             f"and association fails at roughly a third of "
+                             f"a box width. Profile the matching disp_rate_*_ewma column on an "
+                             f"ungated run and "
                              f"divide the budget by it to get the skip length")
+    parser.add_argument("--motion-signal", choices=sorted(MOTION_SIGNALS),
+                        default=DEFAULT_MOTION_SIGNAL,
+                        help=f"which per-track drift statistic the motion budget "
+                             f"spends (default {DEFAULT_MOTION_SIGNAL}). 'max' follows "
+                             f"the fastest box, which is the object association "
+                             f"loses first, but on quiet footage it tracks detector "
+                             f"jitter rather than scene motion and the gate stops "
+                             f"discriminating. 'mean' keeps more of the signal. Both "
+                             f"are logged either way, so an ungated run lets you "
+                             f"profile one against the other before choosing")
+    parser.add_argument("--flow-budget", type=float, default=None,
+                        help=f"'flow' gate only: infer once summed optical flow since "
+                             f"the last inference reaches this value, in fractions of "
+                             f"frame width. Defaults to --motion-budget x "
+                             f"{FLOW_TO_MOTION_RATIO:g}, which is the measured ratio "
+                             f"between flow_moving_p95 and disp_rate_max on this "
+                             f"footage - flow and track displacement are the same unit "
+                             f"but not the same number, so the two gates need separate "
+                             f"budgets to allow the same real staleness. Spending one "
+                             f"--motion-budget on both made every head-to-head unfair "
+                             f"by about 20%%")
+    parser.add_argument("--no-warp", dest="warp_carried", action="store_false",
+                        help="serve carried-forward boxes frozen in place instead of "
+                             "translating each one by the median optical flow of the "
+                             "features inside it. Warping is on by default - freezing "
+                             "is what forces a gate to fire every couple of frames to "
+                             "stay accurate, so --no-warp is for measuring how much "
+                             "the warp is worth, not for running")
     parser.add_argument("--density-metric", choices=sorted(DENSITY_METRICS),
                         default=DEFAULT_DENSITY_METRIC,
                         help=f"which spatial signal drives the logged density state "
@@ -1049,6 +1480,14 @@ def main():
     if args.motion_budget <= 0:
         parser.error("--motion-budget must be > 0")
 
+    if args.flow_budget is not None and args.flow_budget <= 0:
+        parser.error("--flow-budget must be > 0")
+
+    if args.gate == "flow" and not args.warp_carried:
+        print("NOTE: --gate flow with --no-warp. The flow field is being spent on "
+              "the gate decision but not used to move the boxes it gates, which is "
+              "the ablation, not the intended configuration.")
+
     if args.density_lo >= args.density_hi:
         parser.error("--density-lo must be < --density-hi")
 
@@ -1078,12 +1517,18 @@ def main():
     elif args.gate == "budget":
         gate_desc += f" (budget {args.budget:g}, max skip {args.max_skip})"
     elif args.gate == "motion":
-        gate_desc += f" (drift {args.motion_budget:g}, max skip {args.max_skip})"
+        gate_desc += (f" (drift {args.motion_budget:g} on {args.motion_signal}, "
+                      f"max skip {args.max_skip})")
     elif args.gate == "flow":
-        gate_desc += (f" (flow {args.motion_budget:g} on {args.flow_signal}, "
+        eff_flow_budget = (args.flow_budget if args.flow_budget is not None
+                           else args.motion_budget * FLOW_TO_MOTION_RATIO)
+        derived = "" if args.flow_budget is not None else " derived"
+        gate_desc += (f" (flow {eff_flow_budget:g}{derived} on {args.flow_signal}, "
                       f"max skip {args.max_skip})")
     pace_desc = "real-time (source fps)" if args.realtime else "unpaced (max decode speed)"
     flow_desc = f"{args.flow_signal} @ scale {args.flow_scale:g}" if args.use_flow else "off"
+    if args.use_flow:
+        flow_desc += f", warp {'on' if args.warp_carried else 'off'}"
     print(f"Starting {count} concurrent stream(s) -> {args.host} | gate: {gate_desc} | pacing: {pace_desc} "
           f"| density signal: {args.density_metric} ({args.density_lo:g}/{args.density_hi:g}) "
           f"| flow: {flow_desc}"
@@ -1098,10 +1543,13 @@ def main():
                                          jpeg_quality=args.jpeg_quality,
                                          diff_budget=args.budget, max_skip=args.max_skip,
                                          motion_budget=args.motion_budget,
+                                         motion_signal=args.motion_signal,
                                          density_metric=args.density_metric,
                                          density_lo=args.density_lo, density_hi=args.density_hi,
                                          flow_signal=args.flow_signal,
                                          flow_scale=args.flow_scale, use_flow=args.use_flow,
+                                         flow_budget=args.flow_budget,
+                                         warp_carried=args.warp_carried,
                                          tracks_out=args.tracks_out,
                                          max_frames=args.max_frames),
                              name=f"stream-{stream_id}", daemon=True)
