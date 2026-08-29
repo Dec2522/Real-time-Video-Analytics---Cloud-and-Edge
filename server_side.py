@@ -7,12 +7,15 @@ import shutil
 
 from flask import Flask, request, jsonify
 from ultralytics import YOLO
-import cv2 
+import cv2
 import numpy as np
 import psutil
 import time
 from collections import deque, defaultdict
 import threading
+
+from line_counter import (LineCounter, parse_line, line_for, VIDEO_LINES,
+                          DEFAULT_COOLDOWN)
 
 app = Flask(__name__)
 
@@ -21,6 +24,19 @@ HISTORY_LEN = 300          # samples retained per series for the dashboard
 STREAM_TIMEOUT_S = 15      # no traffic for this long => stream counted as finished
 
 CSV_DIR = "results"        # cloud metrics CSVs land here, one per run
+
+# --- Line counting ---
+# The congestion measure: vehicles observed crossing a line, counted here rather
+# than on the edge because this is where detections exist at all. The edge has no
+# model; it only decides which frames are worth paying for. The line for each
+# video is the VIDEO_LINES table in line_counter.py.
+#
+# Lower than line_counter's own default of 5. That default assumes one update per
+# DECODED frame, which is what an offline pass over a --tracks-out dump gets. The
+# server is only handed the frames the gate chose to send, so a track that spans
+# 30 frames may be seen three times - a floor of 5 sightings would discard real
+# vehicles rather than flicker. Tune per video in the registry.
+DEFAULT_COUNT_MIN_AGE = 2
 
 # Cloud metrics CSV layout. The per-core columns sit between these two blocks and
 # are generated at open time, since the core count isn't known until runtime.
@@ -31,6 +47,9 @@ CLOUD_CSV_SUFFIX = [
     "mem_percent", "mem_used_mb", "net_sent_mb", "net_recv_mb",
     "proc_cpu", "proc_mem_mb", "load_avg",
     "inflight_requests", "active_streams",
+    # Line crossings summed over every stream this server has served. Cumulative,
+    # so the interesting quantity is its slope: vehicles per second past the line.
+    "crossings_total",
     # `threads` is the per-worker inference thread cap; `workers` is how many
     # model instances are sharing the box. threads*workers is the core budget.
     "backend", "weights", "imgsz", "int8", "threads", "workers",
@@ -74,6 +93,19 @@ lock = threading.Lock()
 pool = []                         # list[Worker], built in main()
 stream_worker = {}                # stream_id -> Worker, fixed for the run
 assign_lock = threading.Lock()    # guards first-sight worker assignment
+
+# --- --- Line counters --- ---
+# One LineCounter per stream, assigned on first sight like the worker above and
+# fixed for the run: the counter holds each track's previous centre, so it only
+# means anything if it sees that stream's frames in order.
+count_default = None              # --count-line, used when VIDEO_LINES has no entry
+count_min_age = DEFAULT_COUNT_MIN_AGE
+count_enabled = True
+stream_counters = {}              # stream_id -> LineCounter
+no_line_streams = set()           # streams with no line, so the miss is logged once
+counter_last_frame = {}           # stream_id -> last frame number seen
+counter_last_seen = {}            # stream_id -> when that frame arrived
+counter_lock = threading.Lock()   # guards all four of the above
 
 # Detection settings live in one place so every worker is identical and results
 # stay comparable with the earlier single-model runs.
@@ -387,6 +419,7 @@ class Worker:
         with self.lock:
             t_infer = time.time()
             # Fast path: a worker serving a single stream owns that stream's
+            
             # tracker outright, so there is nothing to swap.
             shared = len(self.streams) > 1
             predictor = getattr(self.model, "predictor", None)
@@ -428,6 +461,79 @@ def worker_for(stream_id):
             note = "  (sharing - more streams than workers)" if len(worker.streams) > 1 else ""
             print(f"[server] stream {stream_id} -> worker {worker.idx}{note}")
         return worker
+
+
+def update_crossings(stream_id, video, frame_num, dets):
+    """Advance this stream's counter and return its running totals.
+
+    Returns None when counting is off or no line is known for this video, so the
+    response carries nulls rather than a zero that would read as "nothing has
+    crossed yet".
+    """
+    if not count_enabled:
+        return None
+
+    with counter_lock:
+        # A stream that restarts must start counting from zero. Without this the
+        # server outlives the client, so every run in a sweep inherits the
+        # previous config's total and only the first one means anything.
+        #
+        # Detected two ways. The frame number going backwards is definitive - the
+        # edge counts from 1, so frame 1 after frame 250 is a new run, and this is
+        # what fires between back to back runs in run_gates_edge.sh. The idle
+        # window is the backstop for a rerun that somehow does not rewind.
+        now = time.time()
+        last_frame = counter_last_frame.get(stream_id)
+        last_seen = counter_last_seen.get(stream_id)
+        restarted = ((last_frame is not None and frame_num < last_frame)
+                     or (last_seen is not None and now - last_seen > STREAM_TIMEOUT_S))
+        if restarted:
+            done = stream_counters.pop(stream_id, None)
+            if done is not None:
+                # Logged before it is discarded: the client records its own final
+                # total, but this is the server's only record that the run existed.
+                print(f"[server] stream {stream_id} restarted - previous run counted "
+                      f"{done.total} crossing(s) over {last_frame} frames")
+            no_line_streams.discard(stream_id)
+        counter_last_frame[stream_id] = frame_num
+        counter_last_seen[stream_id] = now
+
+        counter = stream_counters.get(stream_id)
+        if counter is None:
+            if stream_id in no_line_streams:
+                return None
+            line = line_for(video) or count_default
+            if line is None:
+                no_line_streams.add(stream_id)
+                print(f"[server] stream {stream_id}: no counting line for "
+                      f"{video or 'unknown video'} - crossings not counted. Add one "
+                      f"to VIDEO_LINES in line_counter.py, or pass --count-line")
+                return None
+            counter = LineCounter(tuple(line), count_min_age, None, DEFAULT_COOLDOWN,
+                                  # One track, one vehicle. This is a congestion
+                                  # count, not a directional junction study.
+                                  once_per_track=True)
+            stream_counters[stream_id] = counter
+            print(f"[server] stream {stream_id} counting line {tuple(line)} "
+                  f"min_age={counter.min_age} cooldown={counter.cooldown} "
+                  f"(from {video or 'default'})")
+
+        # Held across update() as well: LineCounter carries per-track state and
+        # is not thread safe. One stream is one synchronous edge loop, so this
+        # only ever contends with the dashboard reading totals.
+        counter.update(frame_num, dets)
+        return {"in": counter.counts["in"], "out": counter.counts["out"],
+                "total": counter.total, "unique": len(counter.unique)}
+
+
+def crossings_snapshot():
+    """Per-stream totals for the dashboard, plus the sum for the cloud CSV."""
+    with counter_lock:
+        per_stream = {sid: {"in": c.counts["in"], "out": c.counts["out"],
+                            "total": c.total, "unique": len(c.unique),
+                            "line": list(c.line)}
+                      for sid, c in stream_counters.items()}
+    return per_stream, sum(v["total"] for v in per_stream.values())
 
 
 def active_streams(now=None):
@@ -488,6 +594,8 @@ def sample_cloud_metrics(csv_path=None):
             "load_avg": psutil.getloadavg()[0],
             # Concurrency
             "inflight_requests": inflight,
+            # Congestion: vehicles past the line across every stream, cumulative.
+            "crossings_total": crossings_snapshot()[1],
         }
         with lock:
             record["active_streams"] = len(active_streams(now))
@@ -518,6 +626,12 @@ def sample_cloud_metrics(csv_path=None):
 def detect():
     global inflight
     stream_id = request.args.get("stream", "0")
+    # The edge's own frame number, not the count of requests served. Under gating
+    # those diverge - request 10 can be frame 47 - and the counter's cooldown is
+    # expressed in video frames, so it has to be the edge's clock. Falls back to
+    # the served count for a client that doesn't send it.
+    req_frame = request.args.get("frame", type=int)
+    video = request.args.get("video")
 
     t0 = time.time()
     jpg_bytes = request.data # Get data
@@ -564,11 +678,30 @@ def detect():
         info = stream_info.setdefault(stream_id, {"frames": 0, "video": None, "last_seen": 0})
         info["frames"] += 1
         info["last_seen"] = time.time()
+        if video and not info["video"]:
+            # Learned here rather than waiting for the edge's first /metrics push,
+            # which only arrives every PUSH_EVERY frames - too late to pick this
+            # stream's counting line on frame 1.
+            info["video"] = video
+        served = info["frames"]
+
+    # Vehicles past the line: the congestion measure. Counted from THIS frame's
+    # detections, so it necessarily reflects only the frames the gate chose to
+    # send - which is the quantity the gating experiment is scoring.
+    crossings = update_crossings(stream_id, video, req_frame if req_frame is not None
+                                 else served, dets)
 
     return jsonify({
         "stream_id": stream_id,
         "detections": dets,
         "counts": counts,                          # per-label counts for THIS frame
+        # Running line-crossing totals for this stream, cumulative over the run.
+        # null when no line is configured for the video - distinct from 0, which
+        # means a line exists and nothing has crossed it yet.
+        "count_in": crossings["in"] if crossings else None,
+        "count_out": crossings["out"] if crossings else None,
+        "count_total": crossings["total"] if crossings else None,
+        "count_unique": crossings["unique"] if crossings else None,
         "decode_ms": round(decode_ms, 1),          # cloud-side JPEG decode time
         "inference_ms": round(inference_ms, 1),    # cloud-side compute time for THIS frame
         "queue_wait_ms": round(queue_wait_ms, 1),  # time queued behind a stream sharing this worker
@@ -613,6 +746,11 @@ def metrics_data():
     `edge` is keyed by stream id - each stream pushes on its own cadence, so the
     dashboard draws them as independent series rather than one merged timeline.
     """
+    # Taken before `lock`, not inside it. Both locks are only ever acquired in
+    # this order, and never nested the other way round, so there is nothing to
+    # deadlock against.
+    crossings, crossings_total = crossings_snapshot()
+
     with lock:
         now = time.time()
         live = set(active_streams(now))
@@ -620,6 +758,7 @@ def metrics_data():
             "edge": {sid: list(recs) for sid, recs in edge_metrics_history.items()},
             "cloud": list(cloud_metrics_history),
             "runtime": runtime_info,
+            "crossings_total": crossings_total,
             "streams": [
                 {
                     "id": sid,
@@ -627,6 +766,8 @@ def metrics_data():
                     "frames": info["frames"],
                     "last_seen": info["last_seen"],
                     "active": sid in live,
+                    # null when no line is configured for this stream's video
+                    "crossings": crossings.get(sid),
                 }
                 for sid, info in sorted(stream_info.items())
             ],
@@ -635,6 +776,7 @@ def metrics_data():
 
 def main():
     global imgsz, _infer_threads, _pin_cpus
+    global count_default, count_min_age, count_enabled
 
     parser = argparse.ArgumentParser(description="Cloud inference service.")
     parser.add_argument("--backend", choices=BACKENDS, default="pytorch",
@@ -664,6 +806,17 @@ def main():
                              "default: OpenVINO's TBB pool is process-wide, so in-process "
                              "workers cannot get truly private cores and masking tends to "
                              "concentrate them instead of spreading them")
+    parser.add_argument("--count-line", default=None, metavar="X1,Y1,X2,Y2",
+                        help="line used for any video with no VIDEO_LINES entry in "
+                             "line_counter.py, in normalised coords. Without it, an "
+                             "unlisted video is simply not counted")
+    parser.add_argument("--count-min-age", type=int, default=DEFAULT_COUNT_MIN_AGE,
+                        help=f"sightings a track needs before it may be counted "
+                             f"(default {DEFAULT_COUNT_MIN_AGE}). Counts INFERRED "
+                             f"frames here, not decoded ones, so it wants to be "
+                             f"lower than line_counter's offline default")
+    parser.add_argument("--no-count", dest="count", action="store_false",
+                        help="disable line counting entirely")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--csv", default=None,
                         help=f"cloud metrics CSV path (default: auto-named under {CSV_DIR}/)")
@@ -676,6 +829,23 @@ def main():
 
     if args.workers < 1:
         parser.error("--workers must be >= 1")
+
+    count_enabled = args.count
+    count_min_age = args.count_min_age
+    if count_enabled:
+        if args.count_line:
+            try:
+                count_default = parse_line(args.count_line)
+            except ValueError as exc:
+                parser.error(str(exc))
+        configured = sorted(v for v, line in VIDEO_LINES.items() if line)
+        if configured:
+            print(f"[server] counting lines set for: {', '.join(configured)}")
+        elif count_default is None:
+            # Loud, because the alternative is a run that reports null crossings
+            # and looks like the counter is broken rather than unconfigured.
+            print("[server] no counting lines set. Fill in VIDEO_LINES in "
+                  "line_counter.py, or pass --count-line. Crossings will not be counted.")
 
     if args.infer_threads is not None and args.infer_threads < 1:
         parser.error("--infer-threads must be >= 1")

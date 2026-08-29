@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import queue
 import threading
 import time
@@ -328,6 +329,12 @@ CSV_HEADER = [
     # the same total as a perfect one. Accuracy comes from track_eval.py scoring
     # a --tracks-out dump against an UNGATED dump of the same frames.
     "unique_total",
+    # Vehicles counted across the line, cumulative, as reported by the cloud. THIS
+    # is the accuracy-facing count: a crossing needs identity to hold only over
+    # the two frames either side of the line, so it survives the ID fanning that
+    # makes unique_total above uninterpretable. Compare a gated run's final total
+    # against the ungated run's on the same clip.
+    "count_in", "count_out", "count_total", "count_unique",
     "edge_cpu", "edge_mem", "payload_kb", "bandwidth_mbps",
     "frame_diff", "content_shift_detected",
     # summed frame_diff since the last inference, as it stood when this frame was
@@ -727,6 +734,10 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
     served_conf = None        # confidence floor the cloud applied
     served_int8 = None        # whether it was the quantised build
     conf_floor_checked = False   # only warn about a floor mismatch once
+    # Line-crossing totals as last reported by the cloud. None until the first
+    # response, and None for the whole run if no line is configured for this video.
+    count_in = count_out = count_total = count_unique = None
+    video_name = os.path.basename(video_path)   # registry key for this stream's line
 
     # Density state. Updated per inference, not per frame - a gated frame brings
     # no new detections, so folding it in would just weight the EWMA by how
@@ -969,8 +980,15 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
             try:
                 rt0 = time.time()
                 # Post - stream id keeps the cloud's tracker state separate per video
+                # `frame` and `video` are what let the cloud count line crossings:
+                # the video selects this stream's line from its registry, and the
+                # frame number is the counter's clock. It must be the edge's own
+                # count, not the cloud's tally of requests - under gating those
+                # diverge, and the counter's cooldown is in video frames.
                 resp = session.post(detect_url, data=buf.tobytes(),
-                                    params={"stream": stream_id},
+                                    params={"stream": stream_id,
+                                            "frame": frame_num,
+                                            "video": video_name},
                                     headers={"Content-Type": "application/octet-stream"},
                                     timeout=15)
                 round_trip_ms = (time.time() - rt0) * 1000
@@ -987,6 +1005,14 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
                 served_weights = data.get("served_weights")
                 served_conf = data.get("served_conf")
                 served_int8 = data.get("served_int8")
+                # Cumulative line crossings, counted on the cloud because that is
+                # where detections exist. Carried forward on gated frames rather
+                # than nulled: the total has not changed, and a gap in the column
+                # would read as "counting stopped".
+                count_in = data.get("count_in", count_in)
+                count_out = data.get("count_out", count_out)
+                count_total = data.get("count_total", count_total)
+                count_unique = data.get("count_unique", count_unique)
                 # low_conf_frac is computed here against CLOUD_CONF_FLOOR, so a
                 # cloud serving a different floor makes that column mean something
                 # else. Warn once rather than silently logging incomparable values.
@@ -1181,6 +1207,10 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
             "objects_in_frame": len(dets),
             "counts": object_counts,
             "unique_total": len(seen_ids),
+            "count_in": count_in,
+            "count_out": count_out,
+            "count_total": count_total,
+            "count_unique": count_unique,
             "edge_cpu": edge_cpu,
             "edge_mem": edge_mem,
             "payload_kb": rnd(payload_kb, 1),
@@ -1266,10 +1296,15 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
             state = "**Inferred**" + (" [floor]" if forced_by_floor else "")
         else:
             state = "Not inferred" + (f" [warp {warp_boxes}]" if warp_boxes else "")
+        # '-' rather than 0 when the cloud has no line for this video: no line and
+        # nothing-crossed-yet are different states, and only one of them is a
+        # configuration mistake worth noticing mid-run.
+        crossed_desc = count_total if count_total is not None else "-"
         status_line = (f"Stream: {stream_id} Frame:{frame_num} | {state} | "
                        f"End-to-End: {end_to_end_ms:.0f}ms "
                        f"| {throughput_fps:.1f} FPS | {accrued} | density: {density_state} "
-                       f"| IDs: [{ids_desc}] | ids seen: {len(seen_ids)}")
+                       f"| IDs: [{ids_desc}] | ids seen: {len(seen_ids)} "
+                       f"| crossed: {crossed_desc}")
 
         # Hand the frame's I/O to the sink thread and get straight to the pacing
         # sleep. Everything below this point used to run inside the pacing window.
@@ -1333,7 +1368,12 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
         print(f"stream {stream_id} COMPLETE: gate={gate_mode} {gate_detail}{warp_desc}{pacing_desc}"
               f"frames={frame_num} inferred={frames_inferred} skipped={frames_skipped} "
               f"failed={frames_failed} ids_seen={len(seen_ids)}, "
+              f"crossings={count_total if count_total is not None else 'n/a'}, "
               f"Total time={time.time() - wall_start:.1f}s")
+        if count_total is None:
+            print(f"stream {stream_id} NOTE: no crossings counted - the cloud has no "
+                  f"line for {video_name}. Pick one with pick_line.py and put "
+                  f"count_lines.json where the server runs.")
         if gate_mode != "none" and not tracks_out:
             print(f"stream {stream_id} NOTE: gated run with no --tracks-out, so it "
                   f"cannot be scored. Re-run with --tracks-out and compare against "
