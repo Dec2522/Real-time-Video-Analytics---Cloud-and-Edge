@@ -382,11 +382,26 @@ class ElasticPool:
             new_t = threads_for_worker(new_idx, n, self.cores)
             if w.threads != new_t:
                 self._reprovision(sid, new_idx, n)
-            elif w.idx != new_idx:
-                # Same thread count, different position in the active list.
-                # No model swap needed - just record the new placement.
-                w.idx = new_idx
-                w.cores = core_slice_uneven(new_idx, n, self.cores)
+            else:
+                # Same thread count, so no model swap is needed - but the slice
+                # still has to be recomputed. core_slice_uneven depends on HOW
+                # MANY workers share the machine, not just on this worker's
+                # index, so a worker whose index and thread count both happen to
+                # survive a resize would otherwise keep a slice sized for the
+                # old worker count and collide with its neighbour.
+                self._place(w, new_idx, n)
+
+    def _place(self, worker, idx, n_workers):
+        """Move a worker to its slice for the current worker count, without
+        swapping the model. Re-pins on the next request: threads pin once and
+        cache that they have, so a changed slice has to clear the cache or the
+        already-running threads keep the affinity they were given."""
+        cores = core_slice_uneven(idx, n_workers, self.cores)
+        if worker.idx == idx and worker.cores == cores:
+            return
+        worker.idx = idx
+        worker.cores = cores
+        worker._pinned = threading.local()
 
     def _reprovision(self, sid, idx, n_workers):
         """Swap the worker at `sid` for a fresh one sized for `n_workers`.
@@ -435,9 +450,8 @@ class ElasticPool:
                 new_t = threads_for_worker(new_idx, n_active_after, self.cores)
                 if other.threads != new_t:
                     self._reprovision(sid, new_idx, n_active_after)
-                elif other.idx != new_idx:
-                    other.idx = new_idx
-                    other.cores = core_slice_uneven(new_idx, n_active_after, self.cores)
+                else:
+                    self._place(other, new_idx, n_active_after)
 
             new_idx = n_active_after - 1
             new_threads = threads_for_worker(new_idx, n_active_after, self.cores)
