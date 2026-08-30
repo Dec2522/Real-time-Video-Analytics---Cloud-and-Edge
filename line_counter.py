@@ -49,9 +49,9 @@ DEFAULT_LINE = (0.0, 0.55, 1.0, 0.55)
 # defaulted to DEFAULT_LINE: a plausible line in the wrong place produces counts
 # that look valid, which is worse than no counts at all.
 VIDEO_LINES = {
-    "clip1_cropped.mp4": (0.0,0.18,1,0.16),
-    "clip4_5_cropped.mp4": (0.0, 0.2, 1, 0.17),
-    "clip5_3_cropped.mp4": (0.0,0.225,1,0.175),
+    "clip1_tight.mp4": (0.0,0.18,1,0.16),
+    "clip4_5_tight.mp4": (0.0, 0.2, 1, 0.17),
+    "clip5_3_tight.mp4": (0.0,0.225,1,0.175),
 }
 
 
