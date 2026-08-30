@@ -653,7 +653,8 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
                density_lo=DEFAULT_DENSITY_LO, density_hi=DEFAULT_DENSITY_HI,
                flow_signal=DEFAULT_FLOW_SIGNAL, flow_scale=FLOW_SCALE, use_flow=True,
                flow_budget=None, warp_carried=True,
-               tracks_out=None, max_frames=None):
+               tracks_out=None, max_frames=None,
+               start_delay=0.0, duration=None, loop_video=False):
     """Process a single video stream, sending frames to the cloud for inference, and logging metrics."""
 
     detect_url = f"{host}/detect"
@@ -665,6 +666,14 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
     # still means "the same staleness --motion-budget asks for".
     if flow_budget is None:
         flow_budget = motion_budget * FLOW_TO_MOTION_RATIO
+
+    # Staggered start. Held before the capture is opened so a delayed stream
+    # costs the cloud nothing at all until it arrives - which is the point when
+    # what is being measured is the pool reacting to a stream appearing.
+    if start_delay > 0:
+        with print_lock:
+            print(f"[stream {stream_id}] starting in {start_delay:g}s")
+        time.sleep(start_delay)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -846,14 +855,34 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
                 print(f"[stream {stream_id}] Reached --max-frames {max_frames}.")
             break
 
+        # Wall-clock stop, so a stream's lifetime is set by the clock rather than
+        # by clip length. That is what lets several streams end at staggered
+        # times off the same short clip.
+        if duration is not None and time.time() - wall_start >= duration:
+            with print_lock:
+                print(f"[stream {stream_id}] Reached --duration {duration:g}s.")
+            break
+
         # read frame from disk and time it
         io0 = time.time()
         success, frame = cap.read()
         storage_io_ms = (time.time() - io0) * 1000  
         if not success:
-            with print_lock:
-                print(f"[stream {stream_id}] Playback complete.")
-            break
+            # --loop rewinds instead of ending, so a clip shorter than --duration
+            # still holds the stream open. frame_num keeps climbing across the
+            # seam - the cloud treats a frame number going backwards as a restart
+            # and would reset the counters.
+            if loop_video and frame_num > 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                success, frame = cap.read()
+                # The seam is a scene cut as far as the gates are concerned.
+                # Drop the history so the first frame back is not scored as a
+                # huge content shift.
+                prev_gray = None
+            if not success:
+                with print_lock:
+                    print(f"[stream {stream_id}] Playback complete.")
+                break
         frame_num += 1
 
         # Edge-side analysis of the raw frame: content shift, then optical flow.
@@ -1343,6 +1372,16 @@ def run_stream(stream_id, video_path, host, gate_mode="none", frame_gap=DEFAULT_
     if tracks_file is not None:
         tracks_file.close()
 
+    # Explicit teardown. Without it the cloud can only infer the stream is gone
+    # by waiting out its idle timers, so the freed CPU takes minutes to reach
+    # the streams still running.
+    try:
+        session.post(f"{host}/disconnect", params={"stream": stream_id}, timeout=5)
+    except requests.RequestException as e:
+        with print_lock:
+            print(f"[stream {stream_id}] disconnect failed ({e}); the cloud will "
+                  f"release this worker on its idle timer instead")
+
     with print_lock:
         pacing_desc = (f"paced={src_fps:.3g}fps late={frames_late} max_lag={max_lag_ms:.0f}ms "
                        if frame_interval else "unpaced ")
@@ -1388,6 +1427,28 @@ def main():
                         help="run this many streams, cycling through --videos "
                              "(lets you load-test with copies of one file)")
     parser.add_argument("--host", default=CLOUD_HOST, help="cloud base URL")
+    parser.add_argument("--stream-id-base", type=int, default=0, metavar="N",
+                        help="number the streams from N instead of 0. Stream ids "
+                             "are what the cloud keys its workers on, so two "
+                             "client processes both starting at 0 would be served "
+                             "as the same stream. Give each process its own base "
+                             "when you launch several to test the elastic pool")
+    parser.add_argument("--stagger", type=float, default=0.0, metavar="SECONDS",
+                        help="delay stream N by N*SECONDS before it starts. Streams "
+                             "arriving one at a time is what makes the pool shrink "
+                             "each existing worker's share step by step")
+    parser.add_argument("--duration", type=float, default=None, metavar="SECONDS",
+                        help="stop each stream this many seconds after IT starts "
+                             "(the --stagger delay is not counted). Combine with "
+                             "--stagger-stop to make them leave one at a time")
+    parser.add_argument("--stagger-stop", type=float, default=0.0, metavar="SECONDS",
+                        help="add N*SECONDS to stream N's --duration, so the streams "
+                             "end in sequence and you can watch the pool widen the "
+                             "survivors after each departure")
+    parser.add_argument("--loop", dest="loop_video", action="store_true",
+                        help="rewind and replay the clip at the end instead of "
+                             "finishing, so --duration rather than clip length "
+                             "decides how long the stream lives")
     parser.add_argument("--gate", choices=GATE_MODES, default="none",
                         help="frame gating mode: none = infer on every frame "
                              "(baseline), fixed = every --frame-gap'th frame, "
@@ -1546,6 +1607,15 @@ def main():
     if not 1 <= args.jpeg_quality <= 100:
         parser.error("--jpeg-quality must be between 1 and 100")
 
+    if args.stream_id_base < 0:
+        parser.error("--stream-id-base must be >= 0")
+
+    if args.stagger < 0 or args.stagger_stop < 0:
+        parser.error("--stagger and --stagger-stop must be >= 0")
+
+    if args.duration is not None and args.duration <= 0:
+        parser.error("--duration must be > 0")
+
     count = args.streams or len(args.videos)
     sources = [args.videos[i % len(args.videos)] for i in range(count)]
 
@@ -1565,16 +1635,32 @@ def main():
         derived = "" if args.flow_budget is not None else " derived"
         gate_desc += (f" (flow {eff_flow_budget:g}{derived} on {args.flow_signal}, "
                       f"max skip {args.max_skip})")
+    life_desc = ""
+    if args.stagger:
+        life_desc += f" | stagger: {args.stagger:g}s between starts"
+    if args.duration is not None:
+        life_desc += f" | duration: {args.duration:g}s"
+        if args.stagger_stop:
+            life_desc += f" (+{args.stagger_stop:g}s per stream)"
+    if args.loop_video:
+        life_desc += " | looping clips"
     pace_desc = "real-time (source fps)" if args.realtime else "unpaced (max decode speed)"
     flow_desc = f"{args.flow_signal} @ scale {args.flow_scale:g}" if args.use_flow else "off"
     if args.use_flow:
         flow_desc += f", warp {'on' if args.warp_carried else 'off'}"
-    print(f"Starting {count} concurrent stream(s) -> {args.host} | gate: {gate_desc} | pacing: {pace_desc} "
+    id_hi = args.stream_id_base + count - 1
+    print(f"Starting {count} stream(s) as id {args.stream_id_base}..{id_hi} "
+          f"-> {args.host}{life_desc} | gate: {gate_desc} | pacing: {pace_desc} "
           f"| density signal: {args.density_metric} ({args.density_lo:g}/{args.density_hi:g}) "
           f"| flow: {flow_desc}"
           + (f" | tracks -> {args.tracks_out}_stream*.jsonl" if args.tracks_out else ""))
     threads = []
-    for stream_id, video_path in enumerate(sources):
+    for offset, video_path in enumerate(sources):
+        stream_id = args.stream_id_base + offset
+        # Per-stream lifetime, so arrivals and departures are both spread out
+        # rather than every stream switching on and off together.
+        stream_duration = (None if args.duration is None
+                           else args.duration + offset * args.stagger_stop)
         t = threading.Thread(target=run_stream,
                              kwargs=dict(stream_id=stream_id, video_path=video_path,
                                          host=args.host, gate_mode=args.gate,
@@ -1591,7 +1677,10 @@ def main():
                                          flow_budget=args.flow_budget,
                                          warp_carried=args.warp_carried,
                                          tracks_out=args.tracks_out,
-                                         max_frames=args.max_frames),
+                                         max_frames=args.max_frames,
+                                         start_delay=offset * args.stagger,
+                                         duration=stream_duration,
+                                         loop_video=args.loop_video),
                              name=f"stream-{stream_id}", daemon=True)
         t.start()
         threads.append(t)

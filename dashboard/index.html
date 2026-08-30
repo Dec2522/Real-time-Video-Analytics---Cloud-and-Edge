@@ -138,6 +138,40 @@
   }
   .core-box .core-lbl { font-size: 11px; opacity: 0.9; }
   .core-box .core-val { font-size: 20px; font-weight: 600; }
+  /* who owns this core, drawn inside the CPU box so load and ownership read together */
+  .core-box .core-owner {
+    font-size: 10px; margin-top: 3px; opacity: 0.95;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .core-box .core-owner.unassigned { opacity: 0.6; font-style: italic; }
+
+  /* worker pool */
+  #pool-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; padding-top: 4px; }
+  .worker-card {
+    border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+    font-variant-numeric: tabular-nums; background: var(--page-plane);
+    border-left: 3px solid var(--text-muted);
+  }
+  .worker-card.active  { border-left-color: var(--status-good); }
+  .worker-card.dormant { border-left-color: var(--status-warning); opacity: 0.72; }
+  .worker-card .w-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .worker-card .w-name { font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+  .worker-card .w-name .swatch { width: 9px; height: 9px; border-radius: 2px; flex: none; }
+  .w-state {
+    font-size: 10px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase;
+    border-radius: 999px; padding: 2px 7px; color: #fff;
+  }
+  .w-state.active  { background: var(--status-good); }
+  .w-state.dormant { background: var(--status-warning); }
+  .worker-card .w-meta { font-size: 11px; color: var(--text-secondary); margin-top: 6px; }
+  .worker-card .w-cores { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+  .core-chip {
+    font-size: 10px; border-radius: 4px; padding: 1px 6px;
+    border: 1px solid var(--border); color: var(--text-secondary);
+  }
+  .core-chip.held { color: #fff; border-color: transparent; }
+  .worker-card .w-note { font-size: 10px; color: var(--text-muted); margin-top: 5px; }
+  #pool-empty { font-size: 12px; color: var(--text-muted); padding: 8px 0; }
 </style>
 </head>
 <body>
@@ -218,6 +252,14 @@
           <span class="note" id="percore-note"></span>
         </div>
         <div id="percore-grid"></div>
+      </div>
+      <div class="chart-card">
+        <div class="card-head">
+          <h3>Worker pool</h3>
+          <span class="note" id="pool-note"></span>
+        </div>
+        <div id="pool-grid"></div>
+        <div id="pool-empty">No workers yet - the pool is created on the first frame.</div>
       </div>
     </div>
   </section>
@@ -339,6 +381,7 @@ const state = {
   cloud: [],                 // trimmed cloud samples
   streams: new Map(),        // map lookup
   streamMeta: [],            // server-reported stream roster
+  pool: null,                // server-reported worker/core layout
 };
 
 const seenStreamIds = new Set(); 
@@ -441,7 +484,7 @@ function loadColor(pct) {
 const perCoreGrid = document.getElementById("percore-grid");
 const perCoreNote = document.getElementById("percore-note");
 
-function renderPerCore(cores) {
+function renderPerCore(cores, pool) {
   if (!Array.isArray(cores) || !cores.length) return;
   // build the boxes once (when number of boxes doesn't equal number of cores i.e the start)
   if (perCoreGrid.children.length !== cores.length) {
@@ -449,16 +492,96 @@ function renderPerCore(cores) {
       `<div class="core-box" data-core="${i}">
          <div class="core-lbl">core ${i}</div>
          <div class="core-val">-</div>
+         <div class="core-owner unassigned">unassigned</div>
        </div>`).join("");
   }
   // Update values and colours
+  const owners = coreOwners(pool);
   cores.forEach((pct, i) => {
     const box = perCoreGrid.children[i];
     box.style.background = loadColor(pct);
     box.querySelector(".core-val").textContent = `${Math.round(pct)}%`;
+    // Which stream is entitled to this core right now. Read against the load
+    // above it, this is what shows the split is actually being honoured.
+    const owner = owners.get(i);
+    const ownerEl = box.querySelector(".core-owner");
+    ownerEl.textContent = owner
+      ? (owner.owner != null ? `stream ${owner.owner}` : `worker ${owner.slot}`)
+      : "unassigned";
+    ownerEl.classList.toggle("unassigned", !owner);
   });
   const avg = cores.reduce((a, b) => a + b, 0) / cores.length;
   perCoreNote.textContent = `${cores.length} cores · avg ${Math.round(avg)}%`;
+}
+
+// --- --- Worker pool --- ---
+const poolGrid = document.getElementById("pool-grid");
+const poolNote = document.getElementById("pool-note");
+const poolEmpty = document.getElementById("pool-empty");
+
+// Colour a worker by the stream it serves, so a worker card, its stream chip and
+// its lines on the charts are all the same colour.
+function workerColor(worker) {
+  const ids = streamIds();
+  const own = worker.owner != null ? String(worker.owner) : String(worker.streams[0] ?? "");
+  const i = ids.indexOf(own);
+  return i >= 0 ? streamColor(i) : cssVar("--text-muted");
+}
+
+// Map core index -> the ACTIVE worker holding it. Dormant workers are skipped:
+// they keep the slice they had when they went quiet, but the pool has already
+// widened the active workers over it, so showing them here would double-book cores.
+function coreOwners(pool) {
+  const owners = new Map();
+  if (!pool) return owners;
+  for (const w of pool.workers || []) {
+    if (w.state !== "active") continue;
+    for (const c of w.cores || []) owners.set(c, w);
+  }
+  return owners;
+}
+
+function renderPool(pool) {
+  if (!pool) return;
+  const workers = pool.workers || [];
+
+  poolEmpty.style.display = workers.length ? "none" : "block";
+  const bits = [`${pool.mode} pool`];
+  if (workers.length) {
+    bits.push(`${pool.active_workers} active`);
+    if (pool.dormant_workers) bits.push(`${pool.dormant_workers} dormant`);
+    bits.push(`${pool.cores_assigned}/${pool.cores_total} cores in use`);
+  }
+  if (pool.mode === "elastic" && !pool.pinning) bits.push("pinning off");
+  poolNote.textContent = bits.join(" · ");
+
+  poolGrid.innerHTML = workers.map((w) => {
+    const color = workerColor(w);
+    // A stream that arrives, goes quiet and comes back is reprovisioned each
+    // time. Surfacing the count is what shows the pool actually resized rather
+    // than just relabelled.
+    const gen = w.gen ? ` · resized ${w.gen}×` : "";
+    const idle = w.idle_s == null ? "" : ` · idle ${w.idle_s.toFixed(1)}s`;
+    const label = w.owner != null ? `stream ${w.owner}` : `worker ${w.slot}`;
+    const serving = w.streams.length
+      ? `serving ${w.streams.length === 1 ? "stream " : "streams "}${w.streams.join(", ")}`
+      : "no streams attached";
+    const chips = (w.cores || []).map((c) =>
+      `<span class="core-chip held" style="background:${color}">core ${c}</span>`).join("");
+    const note = w.cores_stale
+      ? "cores released to the active workers; kept warm for an instant wake"
+      : "";
+    return `<div class="worker-card ${w.state}">
+      <div class="w-head">
+        <span class="w-name"><span class="swatch" style="background:${color}"></span>${label}</span>
+        <span class="w-state ${w.state}">${w.state}</span>
+      </div>
+      <div class="w-meta">${w.threads ?? "?"} thread(s)${gen}${idle}</div>
+      <div class="w-meta">${serving}</div>
+      <div class="w-cores">${chips || '<span class="core-chip">no cores</span>'}</div>
+      ${note ? `<div class="w-note">${note}</div>` : ""}
+    </div>`;
+  }).join("");
 }
 
 // --- --- Chart.js setup --- ---
@@ -917,6 +1040,7 @@ function handleSample(data) {
   const edgeByStream = data.edge && !Array.isArray(data.edge) ? data.edge : {};
   const cloudRecs = Array.isArray(data.cloud) ? data.cloud : [];
   state.streamMeta = Array.isArray(data.streams) ? data.streams : [];
+  state.pool = data.pool || null;
 
   // Server returns full history, trim to window size
   // Clear and rebuild the state
@@ -935,8 +1059,9 @@ function handleSample(data) {
   // Update per-core usage visual
   const latestCloud = latestOf(state.cloud);
   if (latestCloud && Array.isArray(latestCloud.cpu_per_core)) {
-    renderPerCore(latestCloud.cpu_per_core);
+    renderPerCore(latestCloud.cpu_per_core, state.pool);
   }
+  renderPool(state.pool);
 
   // Update all stat cards, charts and tables with the new data
   updateStatCards();
