@@ -14,8 +14,7 @@ from collections import deque, defaultdict
 import threading
 
 # Count crossings rather than unique object IDs - YOLO often re-IDs the same object, given an inflated count.
-from line_counter import (LineCounter, parse_line, line_for, VIDEO_LINES,
-                          DEFAULT_COOLDOWN)
+from line_counter import (LineCounter, line_for, VIDEO_LINES)
 
 app = Flask(__name__)
 
@@ -38,7 +37,6 @@ IDLE_TO_RELEASE_S = 300
 
 REPROVISION_RETRIES = 2
 
-# --- Line counting ---===============================================
 DEFAULT_COUNT_MIN_AGE = 2
 
 # Cloud metrics
@@ -539,8 +537,7 @@ def update_crossings(stream_id, video, frame_num, dets):
         if counter is None:
             # lines are predefined for each video - this would be part of an offline profiling step
             line = line_for(video)
-            counter = LineCounter(tuple(line), count_min_age, None, DEFAULT_COOLDOWN,
-                                  once_per_track=True)
+            counter = LineCounter(tuple(line), count_min_age)
             stream_counters[stream_id] = counter
         # run new detections through counter
         counter.update(frame_num, dets)
